@@ -81,6 +81,9 @@ public struct OllamaModelDetails: Sendable, Hashable {
     public var contextLength: Int?
     /// KV-cache size per context token at f16, from the model's shape.
     public var kvBytesPerToken: Int?
+    /// KV cache that doesn't grow with the context: sliding-window layers
+    /// only ever hold their window (Gemma 3/4 keep most layers this way).
+    public var fixedKVBytes: Int = 0
     /// The Go chat template Ollama renders prompts with.
     public var template: String
     /// The per-layer KV head counts were withheld (Ollama omits long arrays
@@ -114,29 +117,44 @@ public struct OllamaModelDetails: Sendable, Hashable {
             if let arch, let v = info["\(arch).\(suffix)"] { return v }
             return info.first { $0.key.hasSuffix(".\(suffix)") }?.value
         }
-        // KV heads summed over layers. Hybrid models (Qwen 3.5/3-Next: linear
-        // attention with a full-attention layer every few blocks) report a
-        // per-layer array with zeros for layers that keep no KV cache.
-        var kvHeadsAllLayers: Int?
+        // KV heads per layer. Hybrid models (Qwen 3.5/3-Next: linear attention
+        // with a full-attention layer every few blocks) report zeros for
+        // layers that keep no KV cache.
+        let blocks = value("block_count") ?? 0
+        var headsPerLayer: [Int]?
         var withheld = false
-        let blocks = value("block_count")
         switch raw("attention.head_count_kv") {
         case .some(let heads) where heads.arrayValue != nil:
-            kvHeadsAllLayers = heads.arrayValue?.compactMap(\.intValue).reduce(0, +)
+            headsPerLayer = heads.arrayValue?.compactMap(\.intValue)
         case .some(let heads) where heads.intValue != nil:
-            kvHeadsAllLayers = blocks.flatMap { b in heads.intValue.map { b * $0 } }
+            headsPerLayer = heads.intValue.map { Array(repeating: $0, count: blocks) }
         case .some(let heads) where heads.isNull:
             withheld = true
         default:
             // No grouped-query attention: every head keeps K and V.
-            kvHeadsAllLayers = blocks.flatMap { b in value("attention.head_count").map { b * $0 } }
+            headsPerLayer = value("attention.head_count").map { Array(repeating: $0, count: blocks) }
         }
         var kv: Int?
+        var fixed = 0
         let keyLength = value("attention.key_length")
             ?? value("embedding_length").flatMap { width in value("attention.head_count").map { width / max(1, $0) } }
-        if let kvHeadsAllLayers, let keyLength, keyLength > 0 {
+        if let headsPerLayer, let keyLength, keyLength > 0 {
             let valueLength = value("attention.value_length") ?? keyLength
-            kv = kvHeadsAllLayers * (keyLength + valueLength) * 2  // f16
+            // Sliding-window layers cache at most `window` tokens, whatever the context.
+            let window = value("attention.sliding_window")
+            let pattern = raw("attention.sliding_window_pattern")?.arrayValue?.compactMap(\.boolValue)
+            let slides = window != nil && pattern?.count == headsPerLayer.count ? pattern! : Array(repeating: false, count: headsPerLayer.count)
+            let keySWA = value("attention.key_length_swa") ?? keyLength
+            let valueSWA = value("attention.value_length_swa") ?? valueLength
+            var perToken = 0
+            for (heads, sliding) in zip(headsPerLayer, slides) {
+                if sliding {
+                    fixed += heads * (keySWA + valueSWA) * 2 * (window ?? 0)
+                } else {
+                    perToken += heads * (keyLength + valueLength) * 2  // f16
+                }
+            }
+            kv = perToken
         }
         var details = OllamaModelDetails(
             capabilities: json["capabilities"]?.arrayValue?.compactMap(\.stringValue) ?? [],
@@ -145,6 +163,7 @@ public struct OllamaModelDetails: Sendable, Hashable {
             template: json["template"]?.stringValue ?? ""
         )
         details.shapeWithheld = withheld
+        details.fixedKVBytes = fixed
         return details
     }
 
@@ -158,9 +177,9 @@ public struct OllamaModelDetails: Sendable, Hashable {
 /// digest (a re-pulled model gets a new digest).
 actor OllamaShapeCache {
     static let shared = OllamaShapeCache()
-    private var kv: [String: Int] = [:]
-    func kvBytesPerToken(for key: String) -> Int? { kv[key] }
-    func store(_ value: Int, for key: String) { kv[key] = value }
+    private var shapes: [String: (perToken: Int, fixed: Int)] = [:]
+    func shape(for key: String) -> (perToken: Int, fixed: Int)? { shapes[key] }
+    func store(_ shape: (perToken: Int, fixed: Int), for key: String) { shapes[key] = shape }
 }
 
 /// A client for Ollama's native (non-OpenAI) API: model management.
@@ -238,11 +257,16 @@ public struct OllamaNativeClient: Sendable {
         var details = OllamaModelDetails.parse(try await showJSON(model, verbose: false, timeout: timeout))
         guard details.shapeWithheld else { return details }
         let key = "\(baseURL.absoluteString)|\(model)|\(digest ?? "")"
-        if let cached = await OllamaShapeCache.shared.kvBytesPerToken(for: key) {
-            details.kvBytesPerToken = cached
-        } else if let kv = OllamaModelDetails.parse(try await showJSON(model, verbose: true, timeout: timeout)).kvBytesPerToken {
-            details.kvBytesPerToken = kv
-            if digest != nil { await OllamaShapeCache.shared.store(kv, for: key) }
+        if let cached = await OllamaShapeCache.shared.shape(for: key) {
+            details.kvBytesPerToken = cached.perToken
+            details.fixedKVBytes = cached.fixed
+        } else {
+            let verbose = OllamaModelDetails.parse(try await showJSON(model, verbose: true, timeout: timeout))
+            if let kv = verbose.kvBytesPerToken {
+                details.kvBytesPerToken = kv
+                details.fixedKVBytes = verbose.fixedKVBytes
+                if digest != nil { await OllamaShapeCache.shared.store((kv, verbose.fixedKVBytes), for: key) }
+            }
         }
         details.shapeWithheld = false
         return details
@@ -395,7 +419,7 @@ public struct OllamaProvider: LLMProvider {
         guard let kvBytes = details?.kvBytesPerToken, kvBytes > 0 else {
             return min(trained, KnownModels.defaultLocalContextWindow)
         }
-        let budget = Double(physicalMemory) * 0.7 - Double(model.size)
+        let budget = Double(physicalMemory) * 0.7 - Double(model.size) - Double(details?.fixedKVBytes ?? 0)
         var chosen = min(trained, contextSteps[0])
         for step in contextSteps where step <= trained && Double(step) * Double(kvBytes) <= budget {
             chosen = step

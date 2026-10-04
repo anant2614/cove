@@ -149,6 +149,18 @@ final class OllamaNativeChatTests: XCTestCase {
         XCTAssertEqual(OllamaProvider.contextLength(for: model, details: withShape, physicalMemory: 16 * Self.gib), 32_768)
     }
 
+    func testSlidingWindowLayersCostAFixedAmount() throws {
+        // Gemma 4 12B: 40 of 48 layers attend over a 1,024-token window; only
+        // the 8 global layers (1 KV head, 512-wide) grow with the context.
+        let gemma = try details("ollama/show_gemma4.json")
+        XCTAssertEqual(gemma.kvBytesPerToken, 8 * 1 * (512 + 512) * 2)
+        XCTAssertEqual(gemma.fixedKVBytes, 40 * 8 * (256 + 256) * 2 * 1_024)
+        XCTAssertFalse(gemma.forcesToolCalls)
+        let model = OllamaModel(name: "gemma4:12b", size: 7_982_000_000)
+        XCTAssertEqual(OllamaProvider.contextLength(for: model, details: gemma, physicalMemory: 16 * Self.gib), 32_768,
+                       "counting every layer as global would have capped it at 4K")
+    }
+
     func testShowFetchesVerboseShapeOnceAndCachesIt() async throws {
         let http = ShowRoutingHTTPClient(normal: try Fixtures.data("ollama/show_qwen3.5.json"),
                                          verbose: try Fixtures.data("ollama/show_qwen3.5_verbose.json"))
