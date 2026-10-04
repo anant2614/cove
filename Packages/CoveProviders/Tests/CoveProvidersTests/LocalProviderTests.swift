@@ -46,10 +46,10 @@ final class LocalProviderTests: XCTestCase {
         }
     }
 
-    func testOllamaProviderListsAndStreamsViaV1() async throws {
+    func testOllamaProviderListsWithoutDetailsAndStreamsNatively() async throws {
         let http = ReplayHTTPClient()
         try http.respond(to: "/api/tags", fixture: "ollama/tags.json")
-        try http.respond(to: "/v1/chat/completions", fixture: "openai/text_stream.sse")
+        try http.respond(to: "/api/chat", fixture: "ollama/chat_thinking.ndjson")
         let provider = OllamaProvider(baseURL: URL(string: "http://localhost:11434")!, http: http)
         XCTAssertEqual(provider.id, .ollama)
         XCTAssertTrue(provider.capabilities.contains(.tools))
@@ -60,16 +60,17 @@ final class LocalProviderTests: XCTestCase {
         XCTAssertTrue(models.allSatisfy { $0.capabilities.contains(.tools) })
         XCTAssertFalse(models[0].capabilities.contains(.vision))
         XCTAssertTrue(models[1].capabilities.contains(.vision))
-        XCTAssertEqual(models[0].contextWindow, 131_072)
+        // /api/show didn't answer: fall back to a conservative context, not the trained maximum.
+        XCTAssertEqual(models[0].contextWindow, KnownModels.defaultLocalContextWindow)
         XCTAssertEqual(models[1].contextWindow, KnownModels.defaultLocalContextWindow)
 
         let events = try await collect(provider.stream(ChatRequest(model: "llama3.2:3b", messages: [.user("Hi")],
                                                                    parameters: .init(maxTokens: 50, topK: 10))))
-        XCTAssertEqual(events.text, "Hello! How can I help you today?")
-        XCTAssertEqual(http.lastRequest?.url.absoluteString, "http://localhost:11434/v1/chat/completions")
+        XCTAssertEqual(events.text, "hi")
+        XCTAssertEqual(http.lastRequest?.url.absoluteString, "http://localhost:11434/api/chat")
         let body = try http.lastBody()
-        XCTAssertEqual(body["top_k"], 10)
-        XCTAssertEqual(body["max_tokens"], 50)
+        XCTAssertEqual(body["options"]?["top_k"], 10)
+        XCTAssertEqual(body["options"]?["num_predict"], 50)
     }
 
     func testDiscoveryOneServerUpOneDown() async throws {
@@ -85,8 +86,9 @@ final class LocalProviderTests: XCTestCase {
         XCTAssertEqual(ollama.models.map(\.id), ["llama3.2:3b", "llava:7b"])
         XCTAssertTrue(ollama.models.allSatisfy { $0.isLocal && $0.providerID == .ollama })
         let urls = Set(http.requests.map(\.url.absoluteString))
-        XCTAssertEqual(urls, ["http://localhost:11434/api/tags", "http://localhost:1234/v1/models"])
-        XCTAssertTrue(http.requests.allSatisfy { $0.timeout <= 0.3 })
+        XCTAssertEqual(urls, ["http://localhost:11434/api/tags", "http://localhost:11434/api/show", "http://localhost:1234/v1/models"])
+        // Probes are quick; per-model details get longer once Ollama is known to be up.
+        XCTAssertTrue(http.requests.filter { $0.url.path != "/api/show" }.allSatisfy { $0.timeout <= 0.3 })
     }
 
     func testDiscoveryLMStudioUpOllamaTooSlow() async throws {

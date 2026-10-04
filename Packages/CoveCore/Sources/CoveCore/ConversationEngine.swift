@@ -80,10 +80,12 @@ public struct EngineSettings: Sendable, Hashable, Codable {
 public struct SendOptions: Sendable {
     /// Overrides the chat's model for this send (e.g. "Retry with a local model").
     public var model: ModelRef?
-    public var toolsEnabled: Bool
+    /// Whether to offer tools. nil = the model's default: on, except for
+    /// models that call a tool whenever one is offered (`.eagerToolCalls`).
+    public var toolsEnabled: Bool?
     public var parameters: GenerationParameters?
 
-    public init(model: ModelRef? = nil, toolsEnabled: Bool = true, parameters: GenerationParameters? = nil) {
+    public init(model: ModelRef? = nil, toolsEnabled: Bool? = nil, parameters: GenerationParameters? = nil) {
         self.model = model
         self.toolsEnabled = toolsEnabled
         self.parameters = parameters
@@ -103,11 +105,15 @@ public final class ConversationEngine: Sendable {
     private let connectivity: any ConnectivityMonitoring
     private let attachmentSink: (any AttachmentSink)?
     private let settingsProvider: @Sendable () async -> EngineSettings
+    private let clock: @Sendable () -> Date
+    private let timeZone: @Sendable () -> TimeZone
     private let contextBuilder = ContextBuilder()
 
     public init(store: any ConversationStore, providers: any ProviderResolving, tools: ToolRegistry, approvals: ApprovalGate,
                 connectivity: any ConnectivityMonitoring, attachmentSink: (any AttachmentSink)? = nil,
-                settings: @escaping @Sendable () async -> EngineSettings = { EngineSettings() }) {
+                settings: @escaping @Sendable () async -> EngineSettings = { EngineSettings() },
+                clock: @escaping @Sendable () -> Date = { Date() },
+                timeZone: @escaping @Sendable () -> TimeZone = { TimeZone.current }) {
         self.store = store
         self.providers = providers
         self.tools = tools
@@ -115,6 +121,8 @@ public final class ConversationEngine: Sendable {
         self.connectivity = connectivity
         self.attachmentSink = attachmentSink
         self.settingsProvider = settings
+        self.clock = clock
+        self.timeZone = timeZone
     }
 
     // MARK: Public API
@@ -168,6 +176,49 @@ public final class ConversationEngine: Sendable {
         + "(for example, current information, reading a link they gave, or an image they asked for). "
         + "For greetings, small talk, and questions you can answer yourself, reply directly without calling any tool."
 
+    /// Whether tools are offered for this send: never to a model that can't
+    /// use them; otherwise the user's choice, defaulting to off only for
+    /// models that would call a tool for every message.
+    static func offersTools(options: SendOptions, model: ModelInfo?, provider: ProviderCapabilities) -> Bool {
+        let supported = model.map { $0.capabilities.contains(.tools) } ?? provider.contains(.tools)
+        guard supported else { return false }
+        return options.toolsEnabled ?? !(model?.capabilities.contains(.eagerToolCalls) ?? false)
+    }
+
+    /// Tells the model today's date. Models have no clock; without this,
+    /// questions about the date send them off fetching web pages. Only the
+    /// day goes in the system prompt so it stays identical all day and
+    /// servers can keep reusing their cached prompt prefix.
+    static func currentDateBlock(now: Date, timeZone: TimeZone) -> String {
+        "Today's date is \(format(now, "EEEE, d MMMM yyyy", timeZone)). The user is in the \(timeZone.identifier) time zone."
+    }
+
+    /// The current time, appended to the newest user message only. In the
+    /// system prompt it would change every minute and force local servers to
+    /// re-read the whole chat (measured: 14 s for a 6K-token chat on a 3B
+    /// model, 69 s on a 14B one, vs. under 0.2 s with the cached prefix).
+    /// The wording keeps small models from volunteering the time or
+    /// "converting" it from UTC.
+    static func currentTimeNote(now: Date, timeZone: TimeZone) -> String {
+        "(Sent at \(format(now, "HH:mm", timeZone)), already in the user's local time; no conversion needed. Only mention it if relevant.)"
+    }
+
+    /// Adds `note` to the last user-typed message of `request`.
+    static func appendingToNewestUserMessage(_ note: String, in request: ChatRequest) -> ChatRequest {
+        var request = request
+        guard let index = request.messages.lastIndex(where: { $0.role == .user && $0.toolResults.isEmpty }) else { return request }
+        request.messages[index].content.append(.text(note))
+        return request
+    }
+
+    private static func format(_ date: Date, _ pattern: String, _ timeZone: TimeZone) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = pattern
+        return formatter.string(from: date)
+    }
+
     // MARK: Loop
 
     private func makeStream(_ body: @escaping @Sendable (AsyncThrowingStream<EngineEvent, Error>.Continuation) async throws -> Void) -> AsyncThrowingStream<EngineEvent, Error> {
@@ -198,9 +249,9 @@ public final class ConversationEngine: Sendable {
         let provider = try await providers.provider(for: model)
         let contextWindow = await providers.contextWindow(for: model)
         let parameters = options.parameters ?? settings.parameters
-        let toolSpecs = options.toolsEnabled && provider.capabilities.contains(.tools)
-            ? tools.specs(enabled: settings.enabledTools, isOnline: isOnline) : []
-        let offlineNotice = options.toolsEnabled ? tools.offlineNotice(enabled: settings.enabledTools, isOnline: isOnline) : nil
+        let offersTools = Self.offersTools(options: options, model: await providers.modelInfo(for: model), provider: provider.capabilities)
+        let toolSpecs = offersTools ? tools.specs(enabled: settings.enabledTools, isOnline: isOnline) : []
+        let offlineNotice = offersTools ? tools.offlineNotice(enabled: settings.enabledTools, isOnline: isOnline) : nil
         let toolContext = ToolContext(chatID: chatID, isOnline: isOnline, attachmentSink: attachmentSink)
         let systemPrompt = [settings.globalSystemPrompt, chat.systemPrompt]
             .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n\n")
@@ -209,17 +260,19 @@ public final class ConversationEngine: Sendable {
         let maxSteps = max(1, settings.maxToolSteps)
         for step in 0..<maxSteps {
             let history = try await store.path(to: leafID)
-            var extra: [String] = []
+            let now = clock(), zone = timeZone()
+            var extra: [String] = [Self.currentDateBlock(now: now, timeZone: zone)]
             if !toolSpecs.isEmpty { extra.append(Self.toolUsePolicy) }
             if let offlineNotice { extra.append(offlineNotice) }
             if step == maxSteps - 1 && !toolSpecs.isEmpty {
                 extra.append("This is the final step: answer now without calling tools.")
             }
-            let (request, _) = try await contextBuilder.build(
+            let (built, _) = try await contextBuilder.build(
                 .init(model: model.modelID, systemPrompt: systemPrompt.isEmpty ? nil : systemPrompt, extraSystemBlocks: extra,
                       history: history, tools: step == maxSteps - 1 ? [] : toolSpecs, parameters: parameters, contextWindow: contextWindow),
                 loadAttachment: { [store] id in try await store.attachmentData(id: id) }
             )
+            let request = Self.appendingToNewestUserMessage(Self.currentTimeNote(now: now, timeZone: zone), in: built)
 
             continuation.yield(.stepStarted(parentID: leafID, model: model))
             let outcome = await stream(provider: provider, request: request, continuation: continuation)

@@ -28,6 +28,10 @@ public struct ProviderCapabilities: OptionSet, Codable, Sendable, Hashable {
     public static let reasoning = ProviderCapabilities(rawValue: 1 << 3)
     public static let embeddings = ProviderCapabilities(rawValue: 1 << 4)
     public static let imageGeneration = ProviderCapabilities(rawValue: 1 << 5)
+    /// The model's chat template tells it to call a function whenever tools
+    /// are offered (e.g. Llama 3.x on Ollama), so offering tools turns every
+    /// message into a tool call. Tools should be opt-in for such models.
+    public static let eagerToolCalls = ProviderCapabilities(rawValue: 1 << 6)
 
     public static let standard: ProviderCapabilities = [.streaming, .vision, .tools]
 }

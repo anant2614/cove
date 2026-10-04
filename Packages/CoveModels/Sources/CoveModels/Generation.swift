@@ -48,12 +48,18 @@ public struct ChatRequest: Sendable, Hashable {
     public var messages: [ChatMessage]
     public var tools: [ToolSpec]
     public var parameters: GenerationParameters
+    /// The context window (in tokens) the request was fitted to. Servers that
+    /// size their context per request (Ollama) must be given this value, or
+    /// they silently drop the start of the prompt.
+    public var contextWindow: Int?
 
-    public init(model: String, messages: [ChatMessage], tools: [ToolSpec] = [], parameters: GenerationParameters = .init()) {
+    public init(model: String, messages: [ChatMessage], tools: [ToolSpec] = [], parameters: GenerationParameters = .init(),
+                contextWindow: Int? = nil) {
         self.model = model
         self.messages = messages
         self.tools = tools
         self.parameters = parameters
+        self.contextWindow = contextWindow
     }
 }
 

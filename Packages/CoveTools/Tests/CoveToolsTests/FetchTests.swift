@@ -140,6 +140,22 @@ final class FetchURLToolTests: XCTestCase {
         XCTAssertTrue(json.text.hasSuffix(#"{"a": "<b>1</b>"}"#))
     }
 
+    func testSearchResultPagesAreRefusedWithoutFetching() async {
+        let http = MockHTTPClient()
+        let registry = ToolRegistry([FetchURLTool(http: http)])
+        for url in ["https://www.google.com/search?q=what%20time", "https://www.google.co.in/search?q=x",
+                    "https://www.bing.com/search?q=x", "https://duckduckgo.com/?q=x", "https://html.duckduckgo.com/html/?q=x"] {
+            let result = await registry.invoke(call("fetch_url", #"{"url":"\#(url)"}"#), context: ToolContext(chatID: "c"))
+            XCTAssertTrue(result.isError, url)
+            XCTAssertTrue(result.text.contains("web_search"), result.text)
+        }
+        XCTAssertTrue(http.requests.isEmpty)
+        // Ordinary pages on the same hosts are still fetchable.
+        for url in ["https://www.google.com", "https://blog.google/technology/ai/", "https://duckduckgo.com/about"] {
+            XCTAssertFalse(FetchURLTool.isSearchResultsPage(URL(string: url)!), url)
+        }
+    }
+
     func testHTTPErrorIsReported() async {
         let http = MockHTTPClient()
         http.on("example.com", status: 404, body: "nope", headers: ["Content-Type": "text/html"])

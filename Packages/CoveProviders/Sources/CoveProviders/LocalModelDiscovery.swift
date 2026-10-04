@@ -44,15 +44,24 @@ public actor LocalModelDiscovery {
     /// Ollama first, then LM Studio.
     public func discover() async -> [DiscoveredLocalServer] {
         let http = self.http, ollamaURL = self.ollamaURL, lmStudioURL = self.lmStudioURL, timeout = self.timeout
-        async let ollama = Self.withTimeout(timeout) { try await Self.probeOllama(http: http, baseURL: ollamaURL, timeout: timeout) }
+        async let ollama = Self.probeOllama(http: http, baseURL: ollamaURL, timeout: timeout)
         async let lmStudio = Self.withTimeout(timeout) { try await Self.probeLMStudio(http: http, baseURL: lmStudioURL, timeout: timeout) }
         return [await ollama, await lmStudio].compactMap { $0 }
     }
 
-    static func probeOllama(http: any HTTPClient, baseURL: URL, timeout: TimeInterval) async throws -> DiscoveredLocalServer {
-        let models = try await OllamaNativeClient(baseURL: baseURL, http: http).tags(timeout: timeout)
+    /// How long to wait for each model's `/api/show` once Ollama has answered.
+    /// Longer than the probe timeout: the server is known to be up, and the
+    /// details decide tool support and the context size.
+    static let ollamaDetailsTimeout: TimeInterval = 2
+
+    static func probeOllama(http: any HTTPClient, baseURL: URL, timeout: TimeInterval) async -> DiscoveredLocalServer? {
+        let client = OllamaNativeClient(baseURL: baseURL, http: http)
+        guard let models = await withTimeout(timeout, { try await client.tags(timeout: timeout) }) else { return nil }
+        let details = await client.details(for: models, timeout: max(timeout, ollamaDetailsTimeout))
         let config = ProviderConfig(id: .ollama, kind: .ollama, name: "Ollama", baseURL: baseURL)
-        return DiscoveredLocalServer(config: config, models: models.map { OllamaProvider.modelInfo($0, providerID: .ollama) })
+        return DiscoveredLocalServer(config: config, models: models.map {
+            OllamaProvider.modelInfo($0, details: details[$0.name], providerID: .ollama)
+        })
     }
 
     static func probeLMStudio(http: any HTTPClient, baseURL: URL, timeout: TimeInterval) async throws -> DiscoveredLocalServer {

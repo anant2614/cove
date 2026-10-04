@@ -60,7 +60,8 @@ struct ComposerView: View {
                         .foregroundStyle(model.toolsEnabled ? Color.accentColor : Color.secondary)
                 }
                 .buttonStyle(.borderless)
-                .help(model.toolsEnabled ? "Tools on (web search, images…). Click to turn off for this chat." : "Tools off for this chat")
+                .disabled(!model.modelSupportsTools)
+                .help(toolsHelp)
                 .accessibilityLabel(model.toolsEnabled ? "Tools on" : "Tools off")
 
                 TextField(model.isStreaming ? "Replying…" : "Message", text: $model.draft, axis: .vertical)
@@ -116,6 +117,15 @@ struct ComposerView: View {
     }
 
     // MARK: Attachments
+
+    private var toolsHelp: String {
+        if !model.modelSupportsTools { return "This model can't use tools" }
+        if model.toolsEnabled { return "Tools on (web search, images…). Click to turn off for this chat." }
+        if model.toolsOffByDefault && model.toolsOverride == nil {
+            return "Tools off: this model calls a tool for every message when tools are offered. Click to turn on for this chat."
+        }
+        return "Tools off for this chat"
+    }
 
     private func stage(_ urls: [URL]) {
         attachError = nil

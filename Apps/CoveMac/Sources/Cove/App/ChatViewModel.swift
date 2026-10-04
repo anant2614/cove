@@ -41,8 +41,8 @@ final class ChatViewModel {
     var error: EngineError?
 
     var draft = ""
-    /// Per-chat switch for offering tools to the model.
-    var toolsEnabled = true
+    /// The user's tools choice for this chat; nil follows the model's default.
+    var toolsOverride: Bool?
     var staged: [StagedAttachment] = []
     /// Set while editing an earlier user message.
     var editingMessageID: String?
@@ -62,6 +62,25 @@ final class ChatViewModel {
     }
 
     var model: ModelRef? { chat?.model }
+
+    /// What the provider reported about the chat's model, if known.
+    var modelInfo: ModelInfo? {
+        guard let model else { return nil }
+        return app.providers.first { $0.id == model.providerID }?.models.first { $0.id == model.modelID }
+    }
+
+    /// False when the model can't call tools at all (tools are never offered).
+    var modelSupportsTools: Bool { modelInfo.map { $0.capabilities.contains(.tools) } ?? true }
+
+    /// Models whose template forces a tool call whenever tools are offered
+    /// start with tools off; the user can still turn them on.
+    var toolsOffByDefault: Bool { modelInfo?.capabilities.contains(.eagerToolCalls) ?? false }
+
+    /// Whether tools will be offered on the next send (mirrors the engine's rule).
+    var toolsEnabled: Bool {
+        get { modelSupportsTools && (toolsOverride ?? !toolsOffByDefault) }
+        set { toolsOverride = newValue }
+    }
     var isLocalModel: Bool {
         guard let model else { return false }
         return app.providers.first { $0.id == model.providerID }?.config.isLocal ?? false
@@ -99,6 +118,7 @@ final class ChatViewModel {
 
     func setModel(_ model: ModelRef?) {
         chat?.model = model
+        toolsOverride = nil
         Task { try? await app.store.chats.setModel(id: chatID, model) }
     }
 
@@ -112,9 +132,9 @@ final class ChatViewModel {
         staged = []
         if let editing = editingMessageID {
             editingMessageID = nil
-            run(app.engine.edit(chatID: chatID, userMessageID: editing, newContent: content, attachmentIDs: attachmentIDs, options: SendOptions(toolsEnabled: toolsEnabled)))
+            run(app.engine.edit(chatID: chatID, userMessageID: editing, newContent: content, attachmentIDs: attachmentIDs, options: SendOptions(toolsEnabled: toolsOverride)))
         } else {
-            run(app.engine.send(chatID: chatID, content: content, attachmentIDs: attachmentIDs, options: SendOptions(toolsEnabled: toolsEnabled)))
+            run(app.engine.send(chatID: chatID, content: content, attachmentIDs: attachmentIDs, options: SendOptions(toolsEnabled: toolsOverride)))
         }
     }
 
@@ -125,7 +145,7 @@ final class ChatViewModel {
 
     func regenerate(_ row: MessageRow, model: ModelRef? = nil) {
         guard !isStreaming else { return }
-        run(app.engine.regenerate(chatID: chatID, messageID: row.message.id, options: SendOptions(model: model, toolsEnabled: toolsEnabled)))
+        run(app.engine.regenerate(chatID: chatID, messageID: row.message.id, options: SendOptions(model: model, toolsEnabled: toolsOverride)))
     }
 
     func beginEdit(_ row: MessageRow) {

@@ -21,6 +21,12 @@ public protocol ProviderResolving: Sendable {
     func contextWindow(for model: ModelRef) async -> Int
     /// A local model to offer when a cloud model can't be reached (§18).
     func fallbackLocalModel() async -> ModelRef?
+    /// What is known about a model (capabilities, context), if anything.
+    func modelInfo(for model: ModelRef) async -> ModelInfo?
+}
+
+extension ProviderResolving {
+    public func modelInfo(for model: ModelRef) async -> ModelInfo? { nil }
 }
 
 /// Network reachability (NWPathMonitor on Apple platforms).

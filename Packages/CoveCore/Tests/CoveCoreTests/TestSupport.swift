@@ -59,6 +59,7 @@ struct MockResolver: ProviderResolving {
     var localIDs: Set<ProviderID> = []
     var window = 128_000
     var fallback: ModelRef?
+    var infos: [ModelRef: ModelInfo] = [:]
 
     func provider(for model: ModelRef) async throws -> any LLMProvider {
         guard let provider = providers[model.providerID] else { throw ProviderError.unsupported("unknown provider") }
@@ -67,6 +68,7 @@ struct MockResolver: ProviderResolving {
     func isLocal(_ providerID: ProviderID) async -> Bool { localIDs.contains(providerID) }
     func contextWindow(for model: ModelRef) async -> Int { window }
     func fallbackLocalModel() async -> ModelRef? { fallback }
+    func modelInfo(for model: ModelRef) async -> ModelInfo? { infos[model] }
 }
 
 /// A tool that echoes its arguments.

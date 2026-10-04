@@ -42,6 +42,13 @@ public struct FetchURLTool: Tool {
 
     public func invoke(_ call: ToolCall, arguments: JSONValue, context: ToolContext) async throws -> ToolResult {
         let url = try Self.validate(try arguments.requiredString("url"))
+        if Self.isSearchResultsPage(url) {
+            // These answer scripted requests with a "having trouble?" stub that
+            // reads like a real (empty) page, and the model then invents an answer.
+            throw ToolError.failed("Search engine result pages block automated reading, so \(url.absoluteString) can't be fetched. "
+                + "Use the web_search tool if it is available; otherwise tell the user that web search isn't set up "
+                + "(Settings → Tools) and answer from what you know.")
+        }
 
         let request = HTTPRequest(url: url, headers: [
             "User-Agent": Self.userAgent,
@@ -92,6 +99,22 @@ public struct FetchURLTool: Tool {
             throw ToolError.invalidArguments("`url` has no host.")
         }
         return url
+    }
+
+    /// Result pages of the big search engines (e.g. google.com/search?q=…).
+    static func isSearchResultsPage(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        let labels = host.split(separator: ".")
+        let path = url.path.lowercased()
+        let hasQuery = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+            .contains { ["q", "p", "query", "text", "wd"].contains($0.name) } ?? false
+        if labels.contains("google") || labels.contains("bing") || labels.contains("yandex") {
+            return path.hasPrefix("/search") || hasQuery
+        }
+        if host.hasSuffix("duckduckgo.com") || host.hasSuffix("search.yahoo.com") || host.hasSuffix("baidu.com") {
+            return hasQuery
+        }
+        return false
     }
 
     enum Kind { case html, text, unsupported }

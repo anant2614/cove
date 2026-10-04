@@ -38,8 +38,8 @@ final class ConversationEngineTests: XCTestCase {
         XCTAssertEqual(path.last?.model, model)
         XCTAssertEqual(saved?.title, "Say hi to the whole world please")
 
-        // The request carried the user message.
-        XCTAssertEqual(provider.request(0).messages.last?.text, "Say hi to the whole world please")
+        // The request carried the user message (plus the current-time note).
+        XCTAssertEqual(provider.request(0).messages.last?.content.first, .text("Say hi to the whole world please"))
     }
 
     func testToolLoopRunsToolAndFeedsResultBack() async throws {
@@ -205,7 +205,7 @@ final class ConversationEngineTests: XCTestCase {
         let path = await store.path(to: head)
         XCTAssertEqual(path.map(\.text), ["better question", "edited answer"])
         // The edited branch's request doesn't include the old branch.
-        XCTAssertEqual(provider.request(2).messages.map(\.text), ["better question"])
+        XCTAssertEqual(provider.request(2).messages.filter { $0.role != .system }.map(\.content.first), [.text("better question")])
     }
 
     func testModelOverrideIsUsed() async {

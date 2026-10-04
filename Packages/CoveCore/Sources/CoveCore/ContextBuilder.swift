@@ -11,7 +11,8 @@ public struct ContextReport: Sendable, Hashable {
 /// Decides what fits in the model's context window (§16):
 /// 1. system prompt (chat/agent instructions + extra blocks such as notices),
 /// 2. chat history from newest to oldest, whole turns at a time, until the
-///    token budget runs out. The newest turn is always included.
+///    token budget runs out. The newest turn is always included; if it alone
+///    is over budget, its tool results are shortened to fit.
 public struct ContextBuilder: Sendable {
     public struct Input: Sendable {
         public var model: String
@@ -58,7 +59,8 @@ public struct ContextBuilder: Sendable {
         let budget = max(0, input.contextWindow - reserved - fixed)
 
         let usable = input.history.filter(Self.isSendable)
-        let turns = Self.turns(of: usable)
+        var turns = Self.turns(of: usable)
+        if let newest = turns.last { turns[turns.count - 1] = Self.fitting(newest, budget: budget) }
         var included: [[Message]] = []
         var used = 0
         for turn in turns.reversed() {
@@ -98,7 +100,8 @@ public struct ContextBuilder: Sendable {
             }
         }
 
-        let request = ChatRequest(model: input.model, messages: chatMessages, tools: input.tools, parameters: input.parameters)
+        let request = ChatRequest(model: input.model, messages: chatMessages, tools: input.tools, parameters: input.parameters,
+                                  contextWindow: input.contextWindow)
         let report = ContextReport(
             includedMessageIDs: messages.map(\.id),
             droppedMessageCount: usable.count - messages.count,
@@ -121,6 +124,44 @@ public struct ContextBuilder: Sendable {
                 }
             }
         default: return !message.content.isEmpty
+        }
+    }
+
+    /// Fewest tokens a shortened tool result keeps.
+    static let minimumToolResultTokens = 200
+    static let toolResultTrimNote = "\n\n[shortened to fit the model's context window]"
+
+    /// Shortens the tool results in `turn` (largest first, in proportion to
+    /// their size) until the turn fits `budget`. Fetched pages are the usual
+    /// cause of a single turn outgrowing a small local context; without this
+    /// the server would silently cut the start of the prompt instead —
+    /// including the system prompt and the user's question.
+    static func fitting(_ turn: [Message], budget: Int) -> [Message] {
+        let cost = turn.reduce(0) { $0 + TokenEstimator.estimate($1.content) }
+        guard cost > budget else { return turn }
+        var sizes: [Int] = []
+        for message in turn {
+            for part in message.content {
+                if case .toolResult(let result) = part { sizes.append(TokenEstimator.estimate(result.text)) }
+            }
+        }
+        let total = sizes.reduce(0, +)
+        guard total > 0 else { return turn }
+        let overflow = cost - budget
+        var index = 0
+        return turn.map { message in
+            var message = message
+            message.content = message.content.map { part in
+                guard case .toolResult(var result) = part else { return part }
+                let size = sizes[index]
+                index += 1
+                let keep = max(minimumToolResultTokens, size - Int((Double(overflow) * Double(size) / Double(total)).rounded(.up)))
+                guard keep < size else { return part }
+                let characters = Int(Double(keep) * TokenEstimator.charactersPerToken / TokenEstimator.safetyMargin)
+                result.text = String(result.text.prefix(characters)) + toolResultTrimNote
+                return .toolResult(result)
+            }
+            return message
         }
     }
 
