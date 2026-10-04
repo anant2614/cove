@@ -26,7 +26,13 @@ struct CoveApp: App {
 
         MenuBarExtra(isInserted: Binding(
             get: { delegate.app.settings.showMenuBarIcon },
-            set: { delegate.app.settings.showMenuBarIcon = $0; delegate.app.saveSettings() }
+            set: { newValue in
+                // SwiftUI writes this binding back on scene updates; only persist real changes,
+                // otherwise the settings mutation re-triggers the scene graph forever.
+                guard delegate.app.settings.showMenuBarIcon != newValue else { return }
+                delegate.app.settings.showMenuBarIcon = newValue
+                delegate.app.saveSettings()
+            }
         )) {
             MenuBarContent(delegate: delegate)
                 .environment(delegate.app)
