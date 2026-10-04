@@ -1,0 +1,6 @@
+data: {"candidates": [{"content": {"parts": [{"text": "**Checking the forecast**\n\nThe user wants Paris weather.","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 61,"totalTokenCount": 61,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 61}],"thoughtsTokenCount": 18},"modelVersion": "gemini-2.5-flash","responseId": "x3ZUaPLwJ5WBgLUP2a7S0Qs"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "I'll look that up"}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 61,"candidatesTokenCount": 5,"totalTokenCount": 84,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 61}],"thoughtsTokenCount": 18},"modelVersion": "gemini-2.5-flash","responseId": "x3ZUaPLwJ5WBgLUP2a7S0Qs"}
+
+data: {"candidates": [{"content": {"parts": [{"text": " for you."},{"functionCall": {"name": "get_weather","args": {"location": "Paris","unit": "celsius"}},"thoughtSignature": "CiQB0e2Kb2Xv"}],"role": "model"},"finishReason": "STOP","index": 0}],"usageMetadata": {"promptTokenCount": 61,"candidatesTokenCount": 27,"totalTokenCount": 106,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 61}],"thoughtsTokenCount": 18},"modelVersion": "gemini-2.5-flash","responseId": "x3ZUaPLwJ5WBgLUP2a7S0Qs"}
+

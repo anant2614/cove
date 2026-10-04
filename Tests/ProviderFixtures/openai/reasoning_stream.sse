@@ -1,0 +1,18 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1745012345-abcDEF","provider":"DeepSeek","model":"deepseek/deepseek-r1","object":"chat.completion.chunk","created":1745012345,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"The user asks"},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1745012345-abcDEF","provider":"DeepSeek","model":"deepseek/deepseek-r1","object":"chat.completion.chunk","created":1745012345,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":" for 2+2."},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1745012345-abcDEF","provider":"DeepSeek","model":"deepseek/deepseek-r1","object":"chat.completion.chunk","created":1745012345,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":" Simple."},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1745012345-abcDEF","provider":"DeepSeek","model":"deepseek/deepseek-r1","object":"chat.completion.chunk","created":1745012345,"choices":[{"index":0,"delta":{"role":"assistant","content":"2 + 2 = 4.","reasoning":null},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1745012345-abcDEF","provider":"DeepSeek","model":"deepseek/deepseek-r1","object":"chat.completion.chunk","created":1745012345,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":null},"finish_reason":"stop","native_finish_reason":"stop","logprobs":null}]}
+
+data: {"id":"gen-1745012345-abcDEF","provider":"DeepSeek","model":"deepseek/deepseek-r1","object":"chat.completion.chunk","created":1745012345,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"native_finish_reason":null,"logprobs":null}],"usage":{"prompt_tokens":12,"completion_tokens":31,"total_tokens":43,"completion_tokens_details":{"reasoning_tokens":24}}}
+
+data: [DONE]
+
