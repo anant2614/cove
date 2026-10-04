@@ -27,7 +27,7 @@ public struct FetchURLTool: Tool {
         ToolSpec(
             name: Self.name,
             description: "Fetch a web page (http or https) and return its main readable text. "
-                + "Use it to read a specific URL the user gave or one found with web search.",
+                + "Use it only to read a specific URL the user gave or one found with web search.",
             inputSchema: [
                 "type": "object",
                 "properties": [

@@ -162,6 +162,12 @@ public final class ConversationEngine: Sendable {
         }
     }
 
+    /// Added to the system prompt whenever tools are offered. Small local
+    /// models otherwise tend to call tools for every message ("hey" → image).
+    static let toolUsePolicy = "You have access to tools. Only call a tool when the user's request clearly needs it "
+        + "(for example, current information, reading a link they gave, or an image they asked for). "
+        + "For greetings, small talk, and questions you can answer yourself, reply directly without calling any tool."
+
     // MARK: Loop
 
     private func makeStream(_ body: @escaping @Sendable (AsyncThrowingStream<EngineEvent, Error>.Continuation) async throws -> Void) -> AsyncThrowingStream<EngineEvent, Error> {
@@ -204,6 +210,7 @@ public final class ConversationEngine: Sendable {
         for step in 0..<maxSteps {
             let history = try await store.path(to: leafID)
             var extra: [String] = []
+            if !toolSpecs.isEmpty { extra.append(Self.toolUsePolicy) }
             if let offlineNotice { extra.append(offlineNotice) }
             if step == maxSteps - 1 && !toolSpecs.isEmpty {
                 extra.append("This is the final step: answer now without calling tools.")

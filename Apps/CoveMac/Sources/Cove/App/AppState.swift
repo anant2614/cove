@@ -89,7 +89,7 @@ final class AppState {
         }
         await registry.load()
         await reloadProviders()
-        rebuildTools()
+        await rebuildToolsNow()
         if isOnline { Task { await registry.refreshCloudModels() } }
     }
 
@@ -145,7 +145,13 @@ final class AppState {
     // MARK: Tools
 
     /// Registers built-in tools according to current settings and keys.
+    /// Tools whose key is missing are not offered to the model at all.
     func rebuildTools() {
+        Task { await rebuildToolsNow() }
+    }
+
+    func rebuildToolsNow() async {
+        let hasOpenAIKey = await registry.openAIKey().map { !$0.isEmpty } ?? false
         for tool in tools.allTools { tools.unregister(name: tool.name) }
         var webSearch: (kind: WebSearchProviderKind, keyProvider: APIKeyProvider)?
         if let kind = settings.webSearchProvider,
@@ -156,7 +162,7 @@ final class AppState {
         }
         let registry = self.registry
         var imageKey: APIKeyProvider?
-        if settings.imageGenerationEnabled {
+        if settings.imageGenerationEnabled && hasOpenAIKey {
             imageKey = { await registry.openAIKey() }
         }
         for tool in BuiltinTools.make(http: http, webSearch: webSearch, imageKeyProvider: imageKey) {

@@ -21,7 +21,7 @@ public struct ToolCallView: View {
             } label: {
                 HStack(spacing: 6) {
                     statusIcon
-                    Text(Self.title(for: call)).font(.callout.weight(.medium))
+                    Text(Self.title(for: call, failed: result?.isError == true)).font(.callout.weight(.medium))
                     if let summary = argumentSummary {
                         Text(summary).font(.callout).foregroundStyle(.secondary).lineLimit(1)
                     }
@@ -34,7 +34,7 @@ public struct ToolCallView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(Self.title(for: call)), \(expanded ? "expanded" : "collapsed")")
+            .accessibilityLabel("\(Self.title(for: call, failed: result?.isError == true)), \(expanded ? "expanded" : "collapsed")")
 
             if !sources.isEmpty {
                 SourcesRow(sources: sources)
@@ -75,12 +75,20 @@ public struct ToolCallView: View {
         }
     }
 
-    static func title(for call: ToolCall) -> String {
+    static func title(for call: ToolCall, failed: Bool = false) -> String {
+        if failed {
+            switch call.name {
+            case "web_search": return "Web search failed"
+            case "fetch_url": return "Couldn't read the page"
+            case "generate_image": return "Couldn't generate an image"
+            default: return "\(call.name) failed"
+            }
+        }
         switch call.name {
-        case "web_search": "Searched the web"
-        case "fetch_url": "Read a web page"
-        case "generate_image": "Generated an image"
-        default: "Used \(call.name)"
+        case "web_search": return "Searched the web"
+        case "fetch_url": return "Read a web page"
+        case "generate_image": return "Generated an image"
+        default: return "Used \(call.name)"
         }
     }
 

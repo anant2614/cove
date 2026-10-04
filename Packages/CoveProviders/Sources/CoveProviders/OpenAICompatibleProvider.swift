@@ -258,6 +258,7 @@ struct OpenAIStreamState {
     }
 
     private var partialCalls: [Int: PartialCall] = [:]
+    private var thinkSplitter = ThinkTagSplitter()
     private var emittedToolCall = false
     private var finishReason: String?
     private var finished = false
@@ -279,7 +280,7 @@ struct OpenAIStreamState {
         if let choice = json["choices"]?[0] {
             let delta = choice["delta"] ?? choice["message"]
             if let text = delta?["content"]?.stringValue, !text.isEmpty {
-                continuation.yield(.textDelta(text))
+                emit(thinkSplitter.feed(text), continuation)
             }
             if let reasoning = delta?["reasoning_content"]?.stringValue ?? delta?["reasoning"]?.stringValue, !reasoning.isEmpty {
                 continuation.yield(.reasoningDelta(reasoning))
@@ -311,6 +312,7 @@ struct OpenAIStreamState {
 
     /// Emits any pending tool calls and the single `.finished` event.
     mutating func finish(_ continuation: AsyncThrowingStream<ChatEvent, Error>.Continuation) {
+        emit(thinkSplitter.finish(), continuation)
         flushToolCalls(continuation)
         guard !finished else { return }
         finished = true
@@ -323,6 +325,15 @@ struct OpenAIStreamState {
             reason = emittedToolCall ? .toolCalls : .stop
         }
         continuation.yield(.finished(reason))
+    }
+
+    private func emit(_ pieces: [ThinkTagSplitter.Piece], _ continuation: AsyncThrowingStream<ChatEvent, Error>.Continuation) {
+        for piece in pieces {
+            switch piece {
+            case .text(let text): continuation.yield(.textDelta(text))
+            case .reasoning(let text): continuation.yield(.reasoningDelta(text))
+            }
+        }
     }
 
     private mutating func flushToolCalls(_ continuation: AsyncThrowingStream<ChatEvent, Error>.Continuation) {

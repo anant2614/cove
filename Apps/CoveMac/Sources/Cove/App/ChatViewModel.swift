@@ -41,11 +41,20 @@ final class ChatViewModel {
     var error: EngineError?
 
     var draft = ""
+    /// Per-chat switch for offering tools to the model.
+    var toolsEnabled = true
     var staged: [StagedAttachment] = []
     /// Set while editing an earlier user message.
     var editingMessageID: String?
 
     @ObservationIgnored private var task: Task<Void, Never>?
+    // Token deltas are buffered and published ~16×/s: updating SwiftUI on
+    // every token stalls rendering at high decode speeds (Enchanted hit the
+    // same issue and throttles too).
+    @ObservationIgnored private var pendingText = ""
+    @ObservationIgnored private var pendingReasoning = ""
+    @ObservationIgnored private var flushScheduled = false
+    private static let flushInterval: UInt64 = 60_000_000
 
     init(chatID: String, app: AppState) {
         self.chatID = chatID
@@ -103,9 +112,9 @@ final class ChatViewModel {
         staged = []
         if let editing = editingMessageID {
             editingMessageID = nil
-            run(app.engine.edit(chatID: chatID, userMessageID: editing, newContent: content, attachmentIDs: attachmentIDs))
+            run(app.engine.edit(chatID: chatID, userMessageID: editing, newContent: content, attachmentIDs: attachmentIDs, options: SendOptions(toolsEnabled: toolsEnabled)))
         } else {
-            run(app.engine.send(chatID: chatID, content: content, attachmentIDs: attachmentIDs))
+            run(app.engine.send(chatID: chatID, content: content, attachmentIDs: attachmentIDs, options: SendOptions(toolsEnabled: toolsEnabled)))
         }
     }
 
@@ -116,7 +125,7 @@ final class ChatViewModel {
 
     func regenerate(_ row: MessageRow, model: ModelRef? = nil) {
         guard !isStreaming else { return }
-        run(app.engine.regenerate(chatID: chatID, messageID: row.message.id, options: SendOptions(model: model)))
+        run(app.engine.regenerate(chatID: chatID, messageID: row.message.id, options: SendOptions(model: model, toolsEnabled: toolsEnabled)))
     }
 
     func beginEdit(_ row: MessageRow) {
@@ -197,10 +206,13 @@ final class ChatViewModel {
         case .stepStarted:
             resetLive()
         case .textDelta(let delta):
-            streamingText += delta
+            pendingText += delta
+            scheduleFlush()
         case .reasoningDelta(let delta):
-            streamingReasoning += delta
+            pendingReasoning += delta
+            scheduleFlush()
         case .toolCallStarted(let call):
+            flushPending()
             liveToolCalls.append(call)
         case .toolCallFinished(let call, let result):
             liveToolResults[call.id] = result
@@ -213,7 +225,30 @@ final class ChatViewModel {
         }
     }
 
+    private func scheduleFlush() {
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.flushInterval)
+            self?.flushPending()
+        }
+    }
+
+    private func flushPending() {
+        flushScheduled = false
+        if !pendingText.isEmpty {
+            streamingText += pendingText
+            pendingText = ""
+        }
+        if !pendingReasoning.isEmpty {
+            streamingReasoning += pendingReasoning
+            pendingReasoning = ""
+        }
+    }
+
     private func resetLive(keepTools: Bool = false) {
+        pendingText = ""
+        pendingReasoning = ""
         streamingText = ""
         streamingReasoning = ""
         if !keepTools {

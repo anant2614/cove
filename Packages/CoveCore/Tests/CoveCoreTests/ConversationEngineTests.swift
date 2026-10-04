@@ -55,7 +55,7 @@ final class ConversationEngineTests: XCTestCase {
         XCTAssertEqual(provider.request(0).tools.map(\.name), ["echo"])
 
         // Second request includes the assistant tool call and the tool result.
-        let second = provider.request(1).messages
+        let second = provider.request(1).messages.filter { $0.role != .system }
         XCTAssertEqual(second.map(\.role), [.user, .assistant, .tool])
         XCTAssertEqual(second[2].toolResults.first?.text, "echo: ping")
 
@@ -222,5 +222,25 @@ final class ConversationEngineTests: XCTestCase {
         XCTAssertNil(result.error)
         XCTAssertEqual(result.events.text, "from local")
         XCTAssertEqual(local.request(0).model, "llama")
+    }
+}
+
+final class ToolPolicyTests: XCTestCase {
+    func testToolUsePolicyOnlyWhenToolsOffered() async {
+        let model = ModelRef(providerID: "mock", modelID: "m")
+        for toolsEnabled in [true, false] {
+            let provider = MockProvider(steps: [.events([.textDelta("hi"), .finished(.stop)])])
+            let chat = Chat(model: model)
+            let store = InMemoryConversationStore(chats: [chat])
+            let engine = ConversationEngine(
+                store: store, providers: MockResolver(providers: ["mock": provider]), tools: ToolRegistry([EchoTool()]),
+                approvals: ApprovalGate(requester: AutoApprover()), connectivity: StaticConnectivity()
+            )
+            _ = await collect(engine.send(chatID: chat.id, content: [.text("hey")], options: SendOptions(toolsEnabled: toolsEnabled)))
+            let request = provider.request(0)
+            let system = request.messages.first { $0.role == .system }?.text ?? ""
+            XCTAssertEqual(system.contains("Only call a tool"), toolsEnabled)
+            XCTAssertEqual(request.tools.isEmpty, !toolsEnabled)
+        }
     }
 }

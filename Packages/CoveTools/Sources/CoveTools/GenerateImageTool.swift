@@ -38,7 +38,7 @@ public struct GenerateImageTool: Tool {
     public var spec: ToolSpec {
         ToolSpec(
             name: Self.name,
-            description: "Generate an image from a text description. The image is shown to the user as an attachment. "
+            description: "Generate an image from a text description. Only use this when the user explicitly asks you to create, draw or generate an image; never for greetings or ordinary questions. The image is shown to the user as an attachment. "
                 + "Write a detailed prompt describing subject, style, composition and lighting.",
             inputSchema: [
                 "type": "object",

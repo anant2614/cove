@@ -55,6 +55,14 @@ struct ComposerView: View {
                             .frame(width: 320, height: 360)
                     }
 
+                Button { model.toolsEnabled.toggle() } label: {
+                    Image(systemName: "wrench.and.screwdriver")
+                        .foregroundStyle(model.toolsEnabled ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(model.toolsEnabled ? "Tools on (web search, images…). Click to turn off for this chat." : "Tools off for this chat")
+                .accessibilityLabel(model.toolsEnabled ? "Tools on" : "Tools off")
+
                 TextField(model.isStreaming ? "Replying…" : "Message", text: $model.draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .lineLimit(1...(compact ? 6 : 12))

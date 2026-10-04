@@ -39,7 +39,7 @@ public struct WebSearchTool: Tool {
         ToolSpec(
             name: Self.name,
             description: "Search the web for current information. Returns titles, URLs and snippets. "
-                + "Use it for recent events, facts you are unsure about, or anything that may have changed. "
+                + "Use it only when the answer needs recent events or facts you don't know; don't search for greetings, small talk or things you can answer directly. "
                 + "Cite the sources you use as Markdown links.",
             inputSchema: [
                 "type": "object",
