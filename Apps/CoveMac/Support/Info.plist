@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Cove</string>
+    <key>CFBundleExecutable</key>
+    <string>Cove</string>
+    <key>CFBundleIdentifier</key>
+    <string>app.cove.Cove</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Cove</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__BUILD__</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>app.cove.Cove</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>cove</string>
+            </array>
+        </dict>
+    </array>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Cove uses the microphone for on-device dictation.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Cove transcribes your dictation on this Mac. Audio never leaves the device.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Cove can read and replace selected text in other apps when you ask it to.</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 Cove</string>
+    <!-- Sparkle auto-update (L1). Replace SUPublicEDKey with the output of Sparkle's generate_keys. -->
+    <key>SUFeedURL</key>
+    <string>https://cove.app/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>__SPARKLE_PUBLIC_KEY__</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+</dict>
+</plist>
