@@ -25,8 +25,8 @@ if [[ "${UNIVERSAL:-0}" == "1" ]]; then
 fi
 
 echo "==> Building Cove $VERSION ($BUILD_NUMBER)"
-swift build -c release --package-path "$APP_PKG" "${ARCH_FLAGS[@]}"
-BIN_DIR="$(swift build -c release --package-path "$APP_PKG" "${ARCH_FLAGS[@]}" --show-bin-path)"
+swift build -c release --package-path "$APP_PKG" ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"}
+BIN_DIR="$(swift build -c release --package-path "$APP_PKG" ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"} --show-bin-path)"
 
 echo "==> Assembling $APP"
 rm -rf "$APP"
