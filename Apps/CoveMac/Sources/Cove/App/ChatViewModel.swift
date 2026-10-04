@@ -66,7 +66,9 @@ final class ChatViewModel {
     }
 
     func reloadRows() async {
-        guard let head = chat?.headMessageID ?? (try? await app.store.chats.fetch(id: chatID))?.headMessageID,
+        var head = chat?.headMessageID
+        if head == nil { head = (try? await app.store.chats.fetch(id: chatID))?.headMessageID }
+        guard let head,
               let path = try? await app.store.messages.path(to: head) else {
             rows = []
             return

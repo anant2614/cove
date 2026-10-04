@@ -141,8 +141,8 @@ struct ComposerView: View {
         let files = Pasteboard.fileURLs()
         if !files.isEmpty {
             stage(files)
-        } else if let (data, _) = Pasteboard.imageData() {
-            stageImage(data)
+        } else if let image = Pasteboard.imageData() {
+            stageImage(image.0)
         }
     }
 

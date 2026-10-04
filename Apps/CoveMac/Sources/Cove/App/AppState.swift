@@ -30,7 +30,7 @@ final class AppState {
     /// Shown when the passphrase lock (D2) is on and keys are still locked.
     var needsUnlock = false
 
-    @ObservationIgnored private let settingsBox = Locked(AppSettings())
+    @ObservationIgnored private let settingsBox: Locked<AppSettings>
     @ObservationIgnored private var chatObservation: Task<Void, Never>?
     @ObservationIgnored private var localRefresh: Task<Void, Never>?
 
@@ -38,12 +38,13 @@ final class AppState {
         let http = URLSessionHTTPClient()
         self.http = http
         var store: CoveStore
+        var startupError: String?
         do {
             let paths = AppPaths.default
             try paths.ensureDirectories()
             store = try CoveStore.open(paths: paths)
         } catch {
-            launchError = "Couldn't open the Cove database: \(error.localizedDescription). Running with a temporary database."
+            startupError = "Couldn't open the Cove database: \(error.localizedDescription). Running with a temporary database."
             let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("CoveAttachments-\(UUID().uuidString)")
             store = try! CoveStore.inMemory(attachmentsDirectory: tmp)
         }
@@ -58,7 +59,8 @@ final class AppState {
         self.approvals = approvals
         let connectivity = NetworkConnectivityMonitor()
         self.connectivity = connectivity
-        let box = settingsBox
+        let box = Locked(AppSettings())
+        self.settingsBox = box
         self.engine = ConversationEngine(
             store: store, providers: registry, tools: tools, approvals: ApprovalGate(requester: approvals),
             connectivity: connectivity, attachmentSink: store.attachments,
@@ -66,6 +68,7 @@ final class AppState {
         )
         isOnline = connectivity.isOnline
         needsUnlock = secrets.isLocked
+        launchError = startupError
     }
 
     // MARK: Launch
@@ -148,10 +151,14 @@ final class AppState {
         if let kind = settings.webSearchProvider,
            let key = try? secrets.secret(for: AppSettings.webSearchKeyRef(kind)), !key.isEmpty {
             let secrets = self.secrets
-            webSearch = (kind, { try? secrets.secret(for: AppSettings.webSearchKeyRef(kind)) })
+            let keyProvider: APIKeyProvider = { try? secrets.secret(for: AppSettings.webSearchKeyRef(kind)) }
+            webSearch = (kind: kind, keyProvider: keyProvider)
         }
         let registry = self.registry
-        let imageKey: APIKeyProvider? = settings.imageGenerationEnabled ? { await registry.openAIKey() } : nil
+        var imageKey: APIKeyProvider?
+        if settings.imageGenerationEnabled {
+            imageKey = { await registry.openAIKey() }
+        }
         for tool in BuiltinTools.make(http: http, webSearch: webSearch, imageKeyProvider: imageKey) {
             tools.register(tool)
         }

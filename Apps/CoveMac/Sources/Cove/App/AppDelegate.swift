@@ -13,7 +13,7 @@ enum WindowRouter {
 
     static func showMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "main" || $0.title == "Cove" && $0.canBecomeMain }) {
+        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "main" || ($0.title == "Cove" && $0.canBecomeMain) }) {
             window.makeKeyAndOrderFront(nil)
         } else {
             openWindow?(id: "main")
@@ -34,9 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         Task { await app.start() }
 
-        KeyboardShortcuts.onKeyUp(for: .quickChat) { [weak self] in self?.toggleQuickChat() }
-        KeyboardShortcuts.onKeyUp(for: .screenshotAsk) { [weak self] in self?.screenshotAsk() }
-        KeyboardShortcuts.onKeyUp(for: .newChat) { [weak self] in self?.newChatInMainWindow() }
+        KeyboardShortcuts.onKeyUp(for: .quickChat) { [weak self] in Task { @MainActor in self?.toggleQuickChat() } }
+        KeyboardShortcuts.onKeyUp(for: .screenshotAsk) { [weak self] in Task { @MainActor in self?.screenshotAsk() } }
+        KeyboardShortcuts.onKeyUp(for: .newChat) { [weak self] in Task { @MainActor in self?.newChatInMainWindow() } }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
