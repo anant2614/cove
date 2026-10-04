@@ -131,6 +131,46 @@ final class OllamaNativeChatTests: XCTestCase {
         }
     }
 
+    func testHybridAttentionModelSumsKVHeadsPerLayer() throws {
+        // Qwen 3.5: linear attention with a full-attention layer every 4th block.
+        let normal = try details("ollama/show_qwen3.5.json")
+        XCTAssertTrue(normal.shapeWithheld, "Ollama withholds the per-layer array without `verbose`")
+        XCTAssertNil(normal.kvBytesPerToken)
+        XCTAssertEqual(Set(normal.capabilities), ["completion", "vision", "tools", "thinking"])
+
+        let verbose = try details("ollama/show_qwen3.5_verbose.json")
+        XCTAssertFalse(verbose.shapeWithheld)
+        // 8 attention layers × 4 KV heads × (256 + 256) × 2 bytes — not 32 × 16 × 512 × 2.
+        XCTAssertEqual(verbose.kvBytesPerToken, 8 * 4 * (256 + 256) * 2)
+
+        var withShape = normal
+        withShape.kvBytesPerToken = verbose.kvBytesPerToken
+        let model = OllamaModel(name: "qwen3.5:9b", size: 6_594_462_816)
+        XCTAssertEqual(OllamaProvider.contextLength(for: model, details: withShape, physicalMemory: 16 * Self.gib), 32_768)
+    }
+
+    func testShowFetchesVerboseShapeOnceAndCachesIt() async throws {
+        let http = ShowRoutingHTTPClient(normal: try Fixtures.data("ollama/show_qwen3.5.json"),
+                                         verbose: try Fixtures.data("ollama/show_qwen3.5_verbose.json"))
+        let client = OllamaNativeClient(baseURL: URL(string: "http://cache-test:11434")!, http: http)
+        let first = try await client.show("qwen3.5:9b", digest: "abc")
+        XCTAssertEqual(first.kvBytesPerToken, 8 * 4 * 512 * 2)
+        XCTAssertFalse(first.capabilities.isEmpty, "capabilities and template still come from the normal response")
+        XCTAssertEqual(http.verboseCount, 1)
+        let second = try await client.show("qwen3.5:9b", digest: "abc")
+        XCTAssertEqual(second.kvBytesPerToken, first.kvBytesPerToken)
+        XCTAssertEqual(http.verboseCount, 1, "the multi-MB verbose response is fetched once per digest")
+    }
+
+    func testThinkFlagFollowsReasoningEffort() {
+        func think(_ effort: ReasoningEffort?) -> JSONValue? {
+            OllamaChat.requestBody(for: ChatRequest(model: "m", messages: [.user("hi")], parameters: .init(reasoningEffort: effort)))["think"]
+        }
+        XCTAssertNil(think(nil), "no preference: the model's default")
+        XCTAssertEqual(think(.minimal), false)
+        XCTAssertEqual(think(.medium), true)
+    }
+
     func testListModelsReadsDetails() async throws {
         let http = ReplayHTTPClient()
         try http.respond(to: "/api/tags", fixture: "ollama/tags.json")
@@ -139,5 +179,29 @@ final class OllamaNativeChatTests: XCTestCase {
         XCTAssertEqual(models.map(\.id), ["llama3.2:3b", "llava:7b"])
         XCTAssertTrue(models.allSatisfy { $0.capabilities.contains(.eagerToolCalls) })
         XCTAssertEqual(http.requests.filter { $0.url.path == "/api/show" }.count, 2)
+    }
+}
+
+/// Serves `/api/show`, answering verbose requests separately and counting them.
+final class ShowRoutingHTTPClient: HTTPClient, @unchecked Sendable {
+    private let normal: Data
+    private let verbose: Data
+    private let lock = NSLock()
+    private var verboseRequests = 0
+    var verboseCount: Int { lock.withLock { verboseRequests } }
+
+    init(normal: Data, verbose: Data) {
+        self.normal = normal
+        self.verbose = verbose
+    }
+
+    func data(for request: HTTPRequest) async throws -> (Data, HTTPResponseHead) {
+        let isVerbose = (try? JSONValue.parse(request.body ?? Data()))?["verbose"] == true
+        if isVerbose { lock.withLock { verboseRequests += 1 } }
+        return (isVerbose ? verbose : normal, HTTPResponseHead(statusCode: 200))
+    }
+
+    func lines(for request: HTTPRequest) async throws -> (HTTPResponseHead, AsyncThrowingStream<String, Error>) {
+        throw ProviderError.unsupported("streaming")
     }
 }

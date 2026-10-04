@@ -43,6 +43,8 @@ final class ChatViewModel {
     var draft = ""
     /// The user's tools choice for this chat; nil follows the model's default.
     var toolsOverride: Bool?
+    /// The user's thinking choice for this chat; nil follows the default.
+    var thinkingOverride: Bool?
     var staged: [StagedAttachment] = []
     /// Set while editing an earlier user message.
     var editingMessageID: String?
@@ -75,6 +77,16 @@ final class ChatViewModel {
     /// Models whose template forces a tool call whenever tools are offered
     /// start with tools off; the user can still turn them on.
     var toolsOffByDefault: Bool { modelInfo?.capabilities.contains(.eagerToolCalls) ?? false }
+
+    /// Whether the model can think before answering (shows the toggle).
+    var modelThinks: Bool { modelInfo?.capabilities.contains(.reasoning) ?? false }
+
+    /// Whether the next reply thinks first. Off by default on local models:
+    /// a 9B model can think for minutes before answering on a laptop.
+    var thinkingEnabled: Bool {
+        get { modelThinks && (thinkingOverride ?? !isLocalModel) }
+        set { thinkingOverride = newValue }
+    }
 
     /// Whether tools will be offered on the next send (mirrors the engine's rule).
     var toolsEnabled: Bool {
@@ -119,6 +131,7 @@ final class ChatViewModel {
     func setModel(_ model: ModelRef?) {
         chat?.model = model
         toolsOverride = nil
+        thinkingOverride = nil
         Task { try? await app.store.chats.setModel(id: chatID, model) }
     }
 
@@ -132,9 +145,9 @@ final class ChatViewModel {
         staged = []
         if let editing = editingMessageID {
             editingMessageID = nil
-            run(app.engine.edit(chatID: chatID, userMessageID: editing, newContent: content, attachmentIDs: attachmentIDs, options: SendOptions(toolsEnabled: toolsOverride)))
+            run(app.engine.edit(chatID: chatID, userMessageID: editing, newContent: content, attachmentIDs: attachmentIDs, options: SendOptions(toolsEnabled: toolsOverride, thinking: thinkingOverride)))
         } else {
-            run(app.engine.send(chatID: chatID, content: content, attachmentIDs: attachmentIDs, options: SendOptions(toolsEnabled: toolsOverride)))
+            run(app.engine.send(chatID: chatID, content: content, attachmentIDs: attachmentIDs, options: SendOptions(toolsEnabled: toolsOverride, thinking: thinkingOverride)))
         }
     }
 
@@ -145,7 +158,7 @@ final class ChatViewModel {
 
     func regenerate(_ row: MessageRow, model: ModelRef? = nil) {
         guard !isStreaming else { return }
-        run(app.engine.regenerate(chatID: chatID, messageID: row.message.id, options: SendOptions(model: model, toolsEnabled: toolsOverride)))
+        run(app.engine.regenerate(chatID: chatID, messageID: row.message.id, options: SendOptions(model: model, toolsEnabled: toolsOverride, thinking: thinkingOverride)))
     }
 
     func beginEdit(_ row: MessageRow) {

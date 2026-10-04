@@ -83,11 +83,16 @@ public struct SendOptions: Sendable {
     /// Whether to offer tools. nil = the model's default: on, except for
     /// models that call a tool whenever one is offered (`.eagerToolCalls`).
     public var toolsEnabled: Bool?
+    /// Whether a reasoning model should think first. nil = the default: off
+    /// for local models (minutes of thinking on a laptop), the provider's own
+    /// default for cloud models.
+    public var thinking: Bool?
     public var parameters: GenerationParameters?
 
-    public init(model: ModelRef? = nil, toolsEnabled: Bool? = nil, parameters: GenerationParameters? = nil) {
+    public init(model: ModelRef? = nil, toolsEnabled: Bool? = nil, thinking: Bool? = nil, parameters: GenerationParameters? = nil) {
         self.model = model
         self.toolsEnabled = toolsEnabled
+        self.thinking = thinking
         self.parameters = parameters
     }
 }
@@ -185,6 +190,18 @@ public final class ConversationEngine: Sendable {
         return options.toolsEnabled ?? !(model?.capabilities.contains(.eagerToolCalls) ?? false)
     }
 
+    /// The reasoning effort to request, or nil to leave the provider default.
+    /// Measured on a 16 GB M4: qwen3.5 9B spent 409 s thinking (31K chars)
+    /// before a 150-word answer, so local models think only when asked.
+    static func reasoningEffort(options: SendOptions, model: ModelInfo?, isLocal: Bool, configured: ReasoningEffort?) -> ReasoningEffort? {
+        guard model?.capabilities.contains(.reasoning) ?? true else { return configured }
+        switch options.thinking {
+        case .some(true): return configured.flatMap { $0 == .minimal ? nil : $0 } ?? .medium
+        case .some(false): return .minimal
+        case .none: return configured ?? (isLocal && model != nil ? .minimal : nil)
+        }
+    }
+
     /// Tells the model today's date. Models have no clock; without this,
     /// questions about the date send them off fetching web pages. Only the
     /// day goes in the system prompt so it stays identical all day and
@@ -248,8 +265,11 @@ public final class ConversationEngine: Sendable {
 
         let provider = try await providers.provider(for: model)
         let contextWindow = await providers.contextWindow(for: model)
-        let parameters = options.parameters ?? settings.parameters
-        let offersTools = Self.offersTools(options: options, model: await providers.modelInfo(for: model), provider: provider.capabilities)
+        let modelInfo = await providers.modelInfo(for: model)
+        var parameters = options.parameters ?? settings.parameters
+        parameters.reasoningEffort = Self.reasoningEffort(options: options, model: modelInfo, isLocal: isLocal,
+                                                         configured: parameters.reasoningEffort)
+        let offersTools = Self.offersTools(options: options, model: modelInfo, provider: provider.capabilities)
         let toolSpecs = offersTools ? tools.specs(enabled: settings.enabledTools, isOnline: isOnline) : []
         let offlineNotice = offersTools ? tools.offlineNotice(enabled: settings.enabledTools, isOnline: isOnline) : nil
         let toolContext = ToolContext(chatID: chatID, isOnline: isOnline, attachmentSink: attachmentSink)

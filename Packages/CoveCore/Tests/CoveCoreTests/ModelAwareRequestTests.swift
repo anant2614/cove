@@ -72,6 +72,21 @@ final class ModelAwareRequestTests: XCTestCase {
         XCTAssertEqual(noted.messages[2], request.messages[2])
     }
 
+    func testThinkingDefaultsOffForLocalModelsOnly() {
+        let thinker = ModelInfo(id: "m", providerID: "p", capabilities: [.streaming, .reasoning])
+        let plain = ModelInfo(id: "m", providerID: "p", capabilities: [.streaming])
+        func effort(_ thinking: Bool?, _ model: ModelInfo?, local: Bool, configured: ReasoningEffort? = nil) -> ReasoningEffort? {
+            ConversationEngine.reasoningEffort(options: SendOptions(thinking: thinking), model: model, isLocal: local, configured: configured)
+        }
+        XCTAssertEqual(effort(nil, thinker, local: true), .minimal, "local thinking models answer directly by default")
+        XCTAssertNil(effort(nil, thinker, local: false), "cloud models keep the provider default")
+        XCTAssertEqual(effort(true, thinker, local: true), .medium)
+        XCTAssertEqual(effort(true, thinker, local: true, configured: .high), .high)
+        XCTAssertEqual(effort(false, thinker, local: false), .minimal)
+        XCTAssertEqual(effort(nil, thinker, local: true, configured: .low), .low, "an explicit setting wins")
+        XCTAssertNil(effort(true, plain, local: true), "models that can't think get no thinking parameter")
+    }
+
     func testRequestCarriesTheContextWindowItWasFittedTo() async {
         let request = await send(capabilities: [.streaming], window: 8_192)
         XCTAssertEqual(request.contextWindow, 8_192)

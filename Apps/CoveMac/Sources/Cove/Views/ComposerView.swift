@@ -64,6 +64,18 @@ struct ComposerView: View {
                 .help(toolsHelp)
                 .accessibilityLabel(model.toolsEnabled ? "Tools on" : "Tools off")
 
+                if model.modelThinks {
+                    Button { model.thinkingEnabled.toggle() } label: {
+                        Image(systemName: "brain")
+                            .foregroundStyle(model.thinkingEnabled ? Color.accentColor : Color.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help(model.thinkingEnabled
+                          ? "Thinking on: better on hard questions, much slower. Click to turn off for this chat."
+                          : "Thinking off: fast replies. Click to let the model think first in this chat.")
+                    .accessibilityLabel(model.thinkingEnabled ? "Thinking on" : "Thinking off")
+                }
+
                 TextField(model.isStreaming ? "Replying…" : "Message", text: $model.draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .lineLimit(1...(compact ? 6 : 12))
