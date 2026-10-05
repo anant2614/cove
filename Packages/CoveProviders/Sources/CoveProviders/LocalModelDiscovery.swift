@@ -32,7 +32,7 @@ public actor LocalModelDiscovery {
     ///   - lmStudioURL: LM Studio's OpenAI-compatible root (ending in `/v1`).
     ///   - timeout: How long to wait for each server, in seconds.
     public init(http: any HTTPClient = URLSessionHTTPClient(), ollamaURL: URL = LocalModelDiscovery.defaultOllamaURL,
-                lmStudioURL: URL = LocalModelDiscovery.defaultLMStudioURL, timeout: TimeInterval = 0.3) {
+                lmStudioURL: URL = LocalModelDiscovery.defaultLMStudioURL, timeout: TimeInterval = 1) {
         self.http = http
         self.ollamaURL = ollamaURL
         self.lmStudioURL = lmStudioURL

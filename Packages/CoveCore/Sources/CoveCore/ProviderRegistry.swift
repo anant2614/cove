@@ -32,6 +32,8 @@ public actor ProviderRegistry: ProviderResolving {
     private var models: [ProviderID: [ModelInfo]] = [:]
     private var errors: [ProviderID: String] = [:]
     private var instances: [ProviderID: any LLMProvider] = [:]
+    /// Probes in a row that a previously found local server has not answered.
+    private var missedProbes: [ProviderID: Int] = [:]
     private var observers: [UUID: @Sendable () -> Void] = [:]
 
     public init(store: CoveStore, secrets: any SecretStore, http: any HTTPClient = URLSessionHTTPClient(),
@@ -55,21 +57,48 @@ public actor ProviderRegistry: ProviderResolving {
         notify()
     }
 
+    /// A local server that stops answering is dropped only after this many
+    /// probes in a row. One slow answer (the probe waits about a second, and a
+    /// Mac that is swapping can take longer) used to remove Ollama outright,
+    /// so every chat failed with "provider removed" until the next refresh.
+    static let missedProbesBeforeRemoval = 3
+
     /// Probes Ollama and LM Studio. Returns true if anything changed.
     @discardableResult
     public func refreshLocal() async -> Bool {
         let found = await discovery.discover()
         let previous = Set(local.map(\.id))
         let previousModels = local.map { models[$0.id] ?? [] }
-        local = found.map(\.config)
-        for server in found { models[server.config.id] = server.models }
-        for id in previous where !found.contains(where: { $0.config.id == id }) {
-            models[id] = nil
-            instances[id] = nil
+        var next = found.map(\.config)
+        for server in found {
+            models[server.config.id] = server.models
+            missedProbes[server.config.id] = nil
         }
+        for config in local where !found.contains(where: { $0.config.id == config.id }) {
+            let misses = (missedProbes[config.id] ?? 0) + 1
+            if misses >= Self.missedProbesBeforeRemoval {
+                missedProbes[config.id] = nil
+                models[config.id] = nil
+                instances[config.id] = nil
+            } else {
+                // Keep it, with its last model list, until it misses a few more.
+                missedProbes[config.id] = misses
+                next.append(config)
+            }
+        }
+        local = next.sorted { Self.localRank($0.id) < Self.localRank($1.id) }
         let changed = previous != Set(local.map(\.id)) || previousModels != local.map { models[$0.id] ?? [] }
         if changed { notify() }
         return changed
+    }
+
+    /// Ollama first, then LM Studio (the order discovery reports them in).
+    private static func localRank(_ id: ProviderID) -> Int {
+        id == .ollama ? 0 : id == .lmStudio ? 1 : 2
+    }
+
+    private static func isLocalServerID(_ id: ProviderID) -> Bool {
+        id == .ollama || id == .lmStudio
     }
 
     /// Re-fetches model lists from every enabled cloud provider.
@@ -85,7 +114,7 @@ public actor ProviderRegistry: ProviderResolving {
 
     public func refreshModels(for id: ProviderID) async {
         do {
-            let provider = try self.provider(id: id)
+            let provider = try await self.provider(id: id)
             let list = try await provider.listModels()
             models[id] = list.sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
             errors[id] = nil
@@ -172,11 +201,11 @@ public actor ProviderRegistry: ProviderResolving {
     // MARK: ProviderResolving
 
     public func provider(for model: ModelRef) async throws -> any LLMProvider {
-        try provider(id: model.providerID)
+        try await provider(id: model.providerID)
     }
 
     public func isLocal(_ providerID: ProviderID) async -> Bool {
-        config(for: providerID)?.isLocal ?? false
+        config(for: providerID)?.isLocal ?? Self.isLocalServerID(providerID)
     }
 
     public func contextWindow(for model: ModelRef) async -> Int {
@@ -217,9 +246,20 @@ public actor ProviderRegistry: ProviderResolving {
         return try? secrets.secret(for: ref)
     }
 
-    private func provider(id: ProviderID) throws -> any LLMProvider {
+    private func provider(id: ProviderID) async throws -> any LLMProvider {
         if let cached = instances[id] { return cached }
-        guard let config = config(for: id) else { throw ProviderError.unsupported("provider \(id.rawValue) (it may have been removed)") }
+        var found = config(for: id)
+        if found == nil, Self.isLocalServerID(id) {
+            // The server may have started after Cove, or been dropped after
+            // missed probes: look again before failing the request.
+            await refreshLocal()
+            found = config(for: id)
+        }
+        guard let config = found else {
+            if id == .ollama { throw ProviderError.unreachable("Ollama on this Mac (is it running?)") }
+            if id == .lmStudio { throw ProviderError.unreachable("LM Studio's local server (is it running?)") }
+            throw ProviderError.unsupported("provider \(id.rawValue) (it may have been removed)")
+        }
         let provider = try ProviderFactory.make(config: config, apiKey: storedKey(for: config), http: http)
         instances[id] = provider
         return provider

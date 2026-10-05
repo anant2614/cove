@@ -19,6 +19,25 @@ private struct StubHTTP: HTTPClient {
     }
 }
 
+/// An Ollama that can be switched off and on between probes.
+private final class SwitchableOllama: HTTPClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var up = true
+    func set(up: Bool) { lock.withLock { self.up = up } }
+
+    func data(for request: HTTPRequest) async throws -> (Data, HTTPResponseHead) {
+        let isUp = lock.withLock { up }
+        guard isUp, request.url.absoluteString.contains("localhost:11434/api/tags") else {
+            throw ProviderError.unreachable(request.url.host ?? "")
+        }
+        return (Data(#"{"models":[{"name":"qwen3.5:9b","model":"qwen3.5:9b"}]}"#.utf8), HTTPResponseHead(statusCode: 200))
+    }
+
+    func lines(for request: HTTPRequest) async throws -> (HTTPResponseHead, AsyncThrowingStream<String, Error>) {
+        throw ProviderError.unreachable(request.url.host ?? "")
+    }
+}
+
 final class ProviderRegistryTests: XCTestCase {
     private func makeRegistry(routes: [String: String]) throws -> (ProviderRegistry, InMemorySecretStore, CoveStore) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -60,6 +79,52 @@ final class ProviderRegistryTests: XCTestCase {
         XCTAssertTrue(isLocal)
         let defaultModel = await registry.defaultModel()
         XCTAssertEqual(defaultModel, fallback)
+    }
+
+    private func makeRegistry(http: SwitchableOllama) throws -> ProviderRegistry {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        return ProviderRegistry(store: try CoveStore.inMemory(attachmentsDirectory: dir), secrets: InMemorySecretStore(), http: http,
+                                discovery: LocalModelDiscovery(http: http))
+    }
+
+    func testLocalServerSurvivesMissedProbes() async throws {
+        let http = SwitchableOllama()
+        let registry = try makeRegistry(http: http)
+        await registry.load()
+        let model = ModelRef(providerID: .ollama, modelID: "qwen3.5:9b")
+
+        // A slow or missed probe (e.g. while the Mac is swapping) must not drop Ollama.
+        http.set(up: false)
+        for _ in 1..<ProviderRegistry.missedProbesBeforeRemoval {
+            await registry.refreshLocal()
+            let models = await registry.snapshot().first { $0.id == .ollama }?.models.map(\.id)
+            XCTAssertEqual(models, ["qwen3.5:9b"])
+            _ = try await registry.provider(for: model)
+        }
+        // Gone for several probes in a row: dropped.
+        await registry.refreshLocal()
+        let afterRemoval = await registry.snapshot()
+        XCTAssertFalse(afterRemoval.contains { $0.id == .ollama })
+    }
+
+    func testDroppedLocalServerIsProbedAgainWhenAChatNeedsIt() async throws {
+        let http = SwitchableOllama()
+        http.set(up: false)
+        let registry = try makeRegistry(http: http)
+        await registry.load()  // Cove started before Ollama
+        let model = ModelRef(providerID: .ollama, modelID: "qwen3.5:9b")
+        do {
+            _ = try await registry.provider(for: model)
+            XCTFail("expected an error while Ollama is down")
+        } catch {
+            XCTAssertEqual(error as? ProviderError, .unreachable("Ollama on this Mac (is it running?)"))
+        }
+        let isLocal = await registry.isLocal(.ollama)
+        XCTAssertTrue(isLocal, "Ollama counts as local even while it isn't answering")
+
+        http.set(up: true)  // Ollama started; no model-picker refresh happened
+        let provider = try await registry.provider(for: model)
+        XCTAssertEqual(provider.id, .ollama)
     }
 
     func testRemoveDeletesKey() async throws {
