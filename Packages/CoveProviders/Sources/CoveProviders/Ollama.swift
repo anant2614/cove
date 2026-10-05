@@ -401,9 +401,14 @@ public struct OllamaProvider: LLMProvider {
         }
         var displayName = model.name
         if let size = model.parameterSize { displayName += " (\(size))" }
+        let context = contextLength(for: model, details: details, physicalMemory: physicalMemory)
+        var memory: Int64?
+        if model.size > 0 {
+            let kv = Int64(details?.kvBytesPerToken ?? 0) * Int64(context) + Int64(details?.fixedKVBytes ?? 0)
+            memory = model.size + kv
+        }
         return ModelInfo(id: model.name, providerID: providerID, displayName: displayName,
-                         contextWindow: contextLength(for: model, details: details, physicalMemory: physicalMemory),
-                         capabilities: capabilities, isLocal: true)
+                         contextWindow: context, capabilities: capabilities, isLocal: true, memoryBytes: memory)
     }
 
     /// Context sizes Cove picks between (`num_ctx`). Larger windows cost

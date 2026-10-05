@@ -26,6 +26,7 @@ public actor ProviderRegistry: ProviderResolving {
     private let secrets: any SecretStore
     private let http: any HTTPClient
     private let discovery: LocalModelDiscovery
+    private let physicalMemory: UInt64
 
     private var configured: [ProviderConfig] = []
     private var local: [ProviderConfig] = []
@@ -37,11 +38,12 @@ public actor ProviderRegistry: ProviderResolving {
     private var observers: [UUID: @Sendable () -> Void] = [:]
 
     public init(store: CoveStore, secrets: any SecretStore, http: any HTTPClient = URLSessionHTTPClient(),
-                discovery: LocalModelDiscovery? = nil) {
+                discovery: LocalModelDiscovery? = nil, physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory) {
         self.store = store
         self.secrets = secrets
         self.http = http
         self.discovery = discovery ?? LocalModelDiscovery(http: http)
+        self.physicalMemory = physicalMemory
     }
 
     // MARK: Loading
@@ -214,10 +216,7 @@ public actor ProviderRegistry: ProviderResolving {
     }
 
     public func fallbackLocalModel() async -> ModelRef? {
-        for config in local {
-            if let model = models[config.id]?.first(where: { !$0.id.contains("embed") }) { return model.ref }
-        }
-        return nil
+        preferredLocalModel()?.ref
     }
 
     /// A sensible default for new chats: the first cloud model, else local.
@@ -225,10 +224,26 @@ public actor ProviderRegistry: ProviderResolving {
         for config in configured where config.enabled {
             if let model = models[config.id]?.first { return model.ref }
         }
-        for config in local {
-            if let model = models[config.id]?.first(where: { !$0.id.contains("embed") }) { return model.ref }
-        }
-        return nil
+        return preferredLocalModel()?.ref
+    }
+
+    /// Share of RAM a model Cove picks on its own may take once loaded. The
+    /// rest stays for macOS and other apps: a default that pushes the Mac
+    /// into swap (gemma4 12B takes ~10 GB on a 16 GB Mac) makes everything
+    /// slow. Bigger models are still there to pick by hand.
+    static let unpromptedModelMemoryShare = 0.5
+
+    /// The local chat model to use when the user hasn't chosen one: the
+    /// largest whose loaded size fits `unpromptedModelMemoryShare` of RAM
+    /// (size stands in for capability). Previously this was whichever model
+    /// the server listed first, i.e. Ollama's most recently pulled one.
+    func preferredLocalModel() -> ModelInfo? {
+        let candidates = local.flatMap { models[$0.id] ?? [] }.filter { !$0.id.lowercased().contains("embed") }
+        let budget = Int64(Double(physicalMemory) * Self.unpromptedModelMemoryShare)
+        let known = candidates.filter { $0.memoryBytes != nil }
+        if let fits = known.filter({ $0.memoryBytes! <= budget }).max(by: { $0.memoryBytes! < $1.memoryBytes! }) { return fits }
+        if let unknown = candidates.first(where: { $0.memoryBytes == nil }) { return unknown }
+        return known.min { $0.memoryBytes! < $1.memoryBytes! }
     }
 
     public func modelInfo(for ref: ModelRef) -> ModelInfo? {

@@ -159,6 +159,11 @@ final class OllamaNativeChatTests: XCTestCase {
         let model = OllamaModel(name: "gemma4:12b", size: 7_982_000_000)
         XCTAssertEqual(OllamaProvider.contextLength(for: model, details: gemma, physicalMemory: 16 * Self.gib), 32_768,
                        "counting every layer as global would have capped it at 4K")
+        let info = OllamaProvider.modelInfo(model, details: gemma, providerID: .ollama, physicalMemory: 16 * Self.gib)
+        XCTAssertEqual(info.memoryBytes, 7_982_000_000 + 32_768 * 16_384 + 40 * 8 * 512 * 2 * 1_024,
+                       "weights + per-token KV at the chosen context + the sliding-window cache")
+        let unknownSize = OllamaProvider.modelInfo(OllamaModel(name: "x", size: 0), details: gemma, providerID: .ollama)
+        XCTAssertNil(unknownSize.memoryBytes)
     }
 
     func testShowFetchesVerboseShapeOnceAndCachesIt() async throws {

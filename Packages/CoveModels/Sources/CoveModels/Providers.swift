@@ -119,15 +119,19 @@ public struct ModelInfo: Codable, Sendable, Hashable, Identifiable {
     public var contextWindow: Int?
     public var capabilities: ProviderCapabilities
     public var isLocal: Bool
+    /// Estimated memory a local model takes once loaded (weights plus its KV
+    /// cache at `contextWindow`); nil when unknown.
+    public var memoryBytes: Int64?
 
     public init(id: String, providerID: ProviderID, displayName: String? = nil, contextWindow: Int? = nil,
-                capabilities: ProviderCapabilities = .standard, isLocal: Bool = false) {
+                capabilities: ProviderCapabilities = .standard, isLocal: Bool = false, memoryBytes: Int64? = nil) {
         self.id = id
         self.providerID = providerID
         self.displayName = displayName ?? id
         self.contextWindow = contextWindow
         self.capabilities = capabilities
         self.isLocal = isLocal
+        self.memoryBytes = memoryBytes
     }
 
     public var ref: ModelRef { ModelRef(providerID: providerID, modelID: id) }

@@ -39,12 +39,13 @@ private final class SwitchableOllama: HTTPClient, @unchecked Sendable {
 }
 
 final class ProviderRegistryTests: XCTestCase {
-    private func makeRegistry(routes: [String: String]) throws -> (ProviderRegistry, InMemorySecretStore, CoveStore) {
+    private func makeRegistry(routes: [String: String], physicalMemory: UInt64 = 16 << 30) throws -> (ProviderRegistry, InMemorySecretStore, CoveStore) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = try CoveStore.inMemory(attachmentsDirectory: dir)
         let secrets = InMemorySecretStore()
         let http = StubHTTP(routes: routes)
-        let registry = ProviderRegistry(store: store, secrets: secrets, http: http, discovery: LocalModelDiscovery(http: http))
+        let registry = ProviderRegistry(store: store, secrets: secrets, http: http, discovery: LocalModelDiscovery(http: http),
+                                        physicalMemory: physicalMemory)
         return (registry, secrets, store)
     }
 
@@ -125,6 +126,23 @@ final class ProviderRegistryTests: XCTestCase {
         http.set(up: true)  // Ollama started; no model-picker refresh happened
         let provider = try await registry.provider(for: model)
         XCTAssertEqual(provider.id, .ollama)
+    }
+
+    func testDefaultLocalModelFitsHalfOfMemory() async throws {
+        // Listed newest first, as Ollama does: the 9.5 GB model used to become every new chat's model.
+        let tags = #"{"models":[{"name":"big:12b","size":9500000000},{"name":"mid:9b","size":6600000000},"#
+            + #"{"name":"small:3b","size":2000000000},{"name":"nomic-embed-text:latest","size":270000000}]}"#
+        for (memory, expected) in [(UInt64(16) << 30, "mid:9b"), (UInt64(32) << 30, "big:12b"), (UInt64(8) << 30, "small:3b")] {
+            let (registry, _, _) = try makeRegistry(routes: ["localhost:11434/api/tags": tags], physicalMemory: memory)
+            await registry.load()
+            let chosen = await registry.defaultModel()
+            XCTAssertEqual(chosen?.modelID, expected, "\(memory >> 30) GB")
+        }
+        // Nothing fits: the smallest one.
+        let (tiny, _, _) = try makeRegistry(routes: ["localhost:11434/api/tags": tags], physicalMemory: 2 << 30)
+        await tiny.load()
+        let smallest = await tiny.defaultModel()
+        XCTAssertEqual(smallest?.modelID, "small:3b")
     }
 
     func testRemoveDeletesKey() async throws {
