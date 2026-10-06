@@ -162,7 +162,10 @@ final class OllamaNativeChatTests: XCTestCase {
         XCTAssertEqual(OllamaProvider.contextLength(for: model, details: gemma, physicalMemory: 16 * Self.gib), 32_768,
                        "counting every layer as global would have capped it at 4K")
         let info = OllamaProvider.modelInfo(model, details: gemma, providerID: .ollama, physicalMemory: 16 * Self.gib)
-        XCTAssertEqual(info.memoryBytes, 7_982_000_000 + 32_768 * 16_384 + 40 * 8 * 512 * 2 * 1_024,
+        let weights: Int64 = 7_982_000_000
+        let perTokenKV: Int64 = 32_768 * 16_384
+        let slidingKV: Int64 = 40 * 8 * 512 * 2 * 1_024
+        XCTAssertEqual(info.memoryBytes, weights + perTokenKV + slidingKV,
                        "weights + per-token KV at the chosen context + the sliding-window cache")
         let unknownSize = OllamaProvider.modelInfo(OllamaModel(name: "x", size: 0), details: gemma, providerID: .ollama)
         XCTAssertNil(unknownSize.memoryBytes)
@@ -173,10 +176,12 @@ final class OllamaNativeChatTests: XCTestCase {
                                          verbose: try Fixtures.data("ollama/show_qwen3.5_verbose.json"))
         let client = OllamaNativeClient(baseURL: URL(string: "http://\(UUID().uuidString.lowercased()):11434")!, http: http)
         let model = OllamaModel(name: "qwen3.5:9b", size: 6_594_462_816, digest: "abc")
-        let first = try XCTUnwrap(await client.details(for: [model], timeout: 2)[model.name])
+        let firstRead = await client.details(for: [model], timeout: 2)
+        let first = try XCTUnwrap(firstRead[model.name])
         XCTAssertEqual(first.kvBytesPerToken, 8 * 4 * 512 * 2)
         XCTAssertTrue(first.capabilities.contains("thinking"))
-        let second = try XCTUnwrap(await client.details(for: [model], timeout: 2)[model.name])
+        let secondRead = await client.details(for: [model], timeout: 2)
+        let second = try XCTUnwrap(secondRead[model.name])
         XCTAssertEqual(second, first)
         XCTAssertEqual(http.counts.normal, 1, "a known digest is not read again")
         XCTAssertEqual(http.counts.verbose, 1, "the multi-MB verbose response is fetched once")
@@ -184,7 +189,8 @@ final class OllamaNativeChatTests: XCTestCase {
         // The verbose shape fails: capabilities and template survive, the shape is retried later.
         let failing = ShowRoutingHTTPClient(normal: try Fixtures.data("ollama/show_qwen3.5.json"), verbose: nil)
         let other = OllamaNativeClient(baseURL: URL(string: "http://\(UUID().uuidString.lowercased()):11434")!, http: failing)
-        let partial = try XCTUnwrap(await other.details(for: [model], timeout: 2)[model.name])
+        let partialRead = await other.details(for: [model], timeout: 2)
+        let partial = try XCTUnwrap(partialRead[model.name])
         XCTAssertTrue(partial.capabilities.contains("thinking"))
         XCTAssertNil(partial.kvBytesPerToken)
         _ = await other.details(for: [model], timeout: 2)
