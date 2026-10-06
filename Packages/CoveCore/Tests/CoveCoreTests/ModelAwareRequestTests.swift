@@ -194,14 +194,32 @@ final class ContextFittingTests: XCTestCase {
 
     func testReasoningAndToolImagesAreNotCounted() async throws {
         let image = ImageContent(mime: "image/png", data: Data(repeating: 1, count: 10))
+        // Six images would cost 6,000 tokens if counted: over the 6,144 budget together with the page.
         let history = [
             message(.user, [.text("draw then describe")]),
             message(.assistant, [.reasoning(page(8_000)), .toolCall(ToolCall(id: "c1", name: "img", arguments: "{}"))]),
-            message(.tool, [.toolResult(ToolResult(callID: "c1", name: "img", text: page(3_000), images: [image, image]))]),
+            message(.tool, [.toolResult(ToolResult(callID: "c1", name: "img", text: page(3_000), images: Array(repeating: image, count: 6)))]),
         ]
         let (request, _) = try await ContextBuilder().build(.init(model: "m", history: history, contextWindow: 8_192),
                                                            loadAttachment: { _ in nil })
         XCTAssertEqual(request.messages.flatMap(\.toolResults).first?.text, page(3_000), "fits once unsent parts are ignored")
         XCTAssertTrue(request.messages.flatMap(\.toolResults).allSatisfy { $0.images.isEmpty })
+    }
+
+    func testSmallResultsSlightlyOverBudgetStubOnlyWhatIsNeeded() async throws {
+        var history = [message(.user, [.text("search a lot")])]
+        for i in 0..<40 {
+            history.append(message(.assistant, [.toolCall(ToolCall(id: "c\(i)", name: "web_search", arguments: "{}"))]))
+            history.append(message(.tool, [.toolResult(ToolResult(callID: "c\(i)", name: "web_search", text: page(150)))]))
+        }
+        let (request, report) = try await ContextBuilder().build(.init(model: "m", history: history, contextWindow: 8_192),
+                                                                loadAttachment: { _ in nil })
+        XCTAssertLessThanOrEqual(report.estimatedInputTokens, report.budgetTokens)
+        let texts = request.messages.flatMap(\.toolResults).map(\.text)
+        let stubbed = texts.filter { $0 == ContextBuilder.omittedToolOutput }.count
+        XCTAssertGreaterThan(stubbed, 0)
+        XCTAssertLessThan(stubbed, 10, "only the fewest oldest results are stubbed")
+        XCTAssertEqual(texts.last, page(150), "results under the floor keep their text")
+        XCTAssertEqual(texts.prefix(stubbed).allSatisfy { $0 == ContextBuilder.omittedToolOutput }, true, "oldest first")
     }
 }

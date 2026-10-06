@@ -162,7 +162,7 @@ public struct OllamaModelDetails: Sendable, Hashable {
             var perToken = 0
             for (heads, sliding) in zip(headsPerLayer, slides) {
                 if sliding {
-                    fixed += heads * (keySWA + valueSWA) * 2 * (window ?? 0)
+                    fixed += heads * (keySWA + valueSWA) * 2 * Self.slidingCacheCells(window: window ?? 0)
                 } else {
                     perToken += heads * (keyLength + valueLength) * 2  // f16
                 }
@@ -180,10 +180,17 @@ public struct OllamaModelDetails: Sendable, Hashable {
         return details
     }
 
+    /// Cells llama.cpp keeps per sliding-window layer: the window plus one
+    /// micro-batch (Ollama runs it with 512), padded to 256.
+    static func slidingCacheCells(window: Int) -> Int {
+        guard window > 0 else { return 0 }
+        return (window + 512 + 255) / 256 * 256
+    }
+
     /// Every n-th layer attends globally, the rest over a sliding window, for
     /// architectures whose GGUF has a window but no pattern key (llama.cpp
-    /// hard-codes these: gemma3 6, gemma2 and gpt-oss 2, cohere2 4).
-    static let defaultSlidingPattern: [String: Int] = ["gemma3": 6, "gemma3n": 6, "gemma2": 2, "gptoss": 2, "gpt-oss": 2, "cohere2": 4]
+    /// hard-codes these: gemma3 6, gemma3n 5, gemma2 and gpt-oss 2, cohere2 4).
+    static let defaultSlidingPattern: [String: Int] = ["gemma3": 6, "gemma3n": 5, "gemma2": 2, "gptoss": 2, "gpt-oss": 2, "cohere2": 4]
 
     /// Which layers use the sliding window: an explicit per-layer pattern, an
     /// integer period, or the architecture's known period. Unknown layouts
@@ -209,9 +216,28 @@ public struct OllamaModelDetails: Sendable, Hashable {
 /// replace real capabilities with name-based guesses.
 actor OllamaDetailsCache {
     static let shared = OllamaDetailsCache()
+    /// How long before a withheld shape is asked for again (the verbose
+    /// response is several MB and slow to parse).
+    static let shapeRetryInterval: TimeInterval = 600
     private var entries: [String: OllamaModelDetails] = [:]
+    private var shapeAttempts: [String: Date] = [:]
+
     func details(for key: String) -> OllamaModelDetails? { entries[key] }
-    func store(_ details: OllamaModelDetails, for key: String) { entries[key] = details }
+
+    /// Stores `details` unless that would replace a complete entry with one
+    /// whose shape is still withheld (two probes can overlap).
+    func store(_ details: OllamaModelDetails, for key: String) {
+        if let existing = entries[key], !existing.shapeWithheld, details.shapeWithheld { return }
+        entries[key] = details
+    }
+
+    /// Whether to fetch the verbose shape now; records the attempt, so an
+    /// overlapping probe doesn't fetch it again.
+    func claimShapeAttempt(for key: String, now: Date = Date()) -> Bool {
+        if let last = shapeAttempts[key], now.timeIntervalSince(last) < Self.shapeRetryInterval { return false }
+        shapeAttempts[key] = now
+        return true
+    }
 }
 
 /// A client for Ollama's native (non-OpenAI) API: model management.
@@ -236,6 +262,11 @@ public struct OllamaNativeClient: Sendable {
     public func tags(timeout: TimeInterval = 10) async throws -> [OllamaModel] {
         let json = try await ProviderSupport.fetchJSON(http, HTTPRequest(url: try ProviderSupport.url(baseURL, "api/tags"), timeout: timeout))
         return Self.parseTags(json)
+    }
+
+    /// The server's version (`GET /api/version`).
+    public func version(timeout: TimeInterval = 5) async throws -> String? {
+        try await ProviderSupport.fetchJSON(http, HTTPRequest(url: try ProviderSupport.url(baseURL, "api/version"), timeout: timeout))["version"]?.stringValue
     }
 
     /// Lists models currently loaded in memory (`GET /api/ps`).
@@ -305,8 +336,11 @@ public struct OllamaNativeClient: Sendable {
     /// verbose shape fetch, which can fail without losing the capabilities.
     /// Models with no details at all are left out (callers fall back to what
     /// `/api/tags` reports, then to the name).
-    public func details(for models: [OllamaModel], timeout: TimeInterval, shapeTimeout: TimeInterval = 15) async -> [String: OllamaModelDetails] {
-        let base = baseURL.absoluteString
+    public func details(for models: [OllamaModel], timeout: TimeInterval, shapeTimeout: TimeInterval = 5,
+                        serverVersion: String? = nil) async -> [String: OllamaModelDetails] {
+        // The server version is part of the key: an upgraded Ollama may report
+        // more about the same digest (capabilities, templates).
+        let base = "\(baseURL.absoluteString)|\(serverVersion ?? "")"
         return await withTaskGroup(of: (String, OllamaModelDetails?).self) { group in
             for model in models {
                 group.addTask {
@@ -316,14 +350,17 @@ public struct OllamaNativeClient: Sendable {
                         details = await LocalModelDiscovery.withTimeout(timeout) { try await self.show(model.name, timeout: timeout) }
                     }
                     guard var found = details else { return (model.name, nil) }
-                    if found.shapeWithheld,
+                    if found.shapeWithheld, await OllamaDetailsCache.shared.claimShapeAttempt(for: key),
                        let shape = await LocalModelDiscovery.withTimeout(shapeTimeout, { try await self.shape(model.name, timeout: shapeTimeout) }) ?? nil {
                         found.kvBytesPerToken = shape.perToken
                         found.fixedKVBytes = shape.fixed
                         found.shapeWithheld = false
                     }
-                    // Cache once complete; a still-withheld shape is retried next time.
-                    if model.digest != nil { await OllamaDetailsCache.shared.store(found, for: key) }
+                    if model.digest != nil {
+                        await OllamaDetailsCache.shared.store(found, for: key)
+                        // An overlapping probe may have completed the shape meanwhile.
+                        if let cached = await OllamaDetailsCache.shared.details(for: key), !cached.shapeWithheld { found = cached }
+                    }
                     return (model.name, found)
                 }
             }
@@ -336,7 +373,7 @@ public struct OllamaNativeClient: Sendable {
     /// Installed models as `ModelInfo`, enriched with `/api/show` details.
     public func modelInfos(providerID: ProviderID, timeout: TimeInterval = 10, detailsTimeout: TimeInterval = 5) async throws -> [ModelInfo] {
         let models = try await tags(timeout: timeout)
-        let details = await details(for: models, timeout: detailsTimeout)
+        let details = await details(for: models, timeout: detailsTimeout, serverVersion: try? await version(timeout: detailsTimeout))
         return models.map { OllamaProvider.modelInfo($0, details: details[$0.name], providerID: providerID) }
     }
 
@@ -427,13 +464,20 @@ public struct OllamaProvider: LLMProvider {
                           physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> ModelInfo {
         var capabilities: ProviderCapabilities = [.streaming]
         let reported = details.flatMap { $0.capabilities.isEmpty ? nil : $0.capabilities } ?? (model.capabilities.isEmpty ? nil : model.capabilities)
-        if let reported, !reported.contains("completion"), reported.contains("embedding") {
-            // Embedding-only (bge-m3, all-minilm…): can't chat, never a chat default.
-            capabilities = [.embeddings]
+        if let reported, !reported.contains("completion") {
+            // Embedding-only (bge-m3, all-minilm…) or other non-chat models
+            // (image generation): never in the chat picker or a chat default.
+            capabilities = reported.contains("embedding") ? [.embeddings] : []
         } else if let reported {
             if reported.contains("tools") {
                 capabilities.insert(.tools)
-                if details?.forcesToolCalls == true { capabilities.insert(.eagerToolCalls) }
+                if let details {
+                    if details.forcesToolCalls { capabilities.insert(.eagerToolCalls) }
+                } else if (model.family ?? "").lowercased() == "llama" {
+                    // Template unknown (only /api/tags answered): Llama 3.x
+                    // templates force a call whenever tools are offered.
+                    capabilities.insert(.eagerToolCalls)
+                }
             }
             if reported.contains("vision") { capabilities.insert(.vision) }
             if reported.contains("thinking") { capabilities.insert(.reasoning) }
@@ -456,7 +500,8 @@ public struct OllamaProvider: LLMProvider {
             memory = model.size + kv
         }
         return ModelInfo(id: model.name, providerID: providerID, displayName: displayName,
-                         contextWindow: context, capabilities: capabilities, isLocal: true, memoryBytes: memory)
+                         contextWindow: context, capabilities: capabilities, isLocal: true, memoryBytes: memory,
+                         revision: model.digest)
     }
 
     /// Name and family guesses for servers too old to report capabilities.

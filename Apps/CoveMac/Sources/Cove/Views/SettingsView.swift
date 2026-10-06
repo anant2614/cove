@@ -32,7 +32,7 @@ struct GeneralSettings: View {
                 Picker("Default model", selection: Binding(get: { app.settings.defaultModel }, set: { app.settings.defaultModel = $0; app.saveSettings() })) {
                     Text("Automatic").tag(ModelRef?.none)
                     ForEach(app.providers) { provider in
-                        ForEach(provider.models) { model in
+                        ForEach(provider.models.filter(AppState.canChat)) { model in
                             Text("\(provider.config.name) · \(model.displayName)").tag(ModelRef?.some(model.ref))
                         }
                     }
@@ -40,7 +40,7 @@ struct GeneralSettings: View {
                 Picker("Quick chat model", selection: Binding(get: { app.settings.quickChatModel }, set: { app.settings.quickChatModel = $0; app.saveSettings() })) {
                     Text("Same as default").tag(ModelRef?.none)
                     ForEach(app.providers) { provider in
-                        ForEach(provider.models) { model in
+                        ForEach(provider.models.filter(AppState.canChat)) { model in
                             Text("\(provider.config.name) · \(model.displayName)").tag(ModelRef?.some(model.ref))
                         }
                     }
@@ -87,7 +87,11 @@ struct ProvidersSettings: View {
                 }
                 ForEach(locals) { provider in
                     LabeledContent(provider.config.name) {
-                        Text("\(provider.models.count) models").foregroundStyle(.secondary)
+                        if let problem = provider.lastError {
+                            Text(problem).foregroundStyle(.orange)
+                        } else {
+                            Text("\(provider.models.filter(AppState.canChat).count) models").foregroundStyle(.secondary)
+                        }
                     }
                 }
                 Button("Refresh") { Task { await app.registry.refreshLocal() } }

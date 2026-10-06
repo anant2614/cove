@@ -44,6 +44,7 @@ final class AppState {
     @ObservationIgnored private var chatObservation: Task<Void, Never>?
     @ObservationIgnored private var localRefresh: Task<Void, Never>?
     @ObservationIgnored private var localRefreshDeadline: Date?
+    @ObservationIgnored private var lastLocalRefresh = Date.distantPast
 
     init() {
         let http = URLSessionHTTPClient()
@@ -144,9 +145,17 @@ final class AppState {
     /// (a cancelled probe used to report models without their details).
     func modelPickerOpened() {
         localRefreshDeadline = Date().addingTimeInterval(120)
-        guard localRefresh == nil else { return }
+        guard localRefresh == nil else {
+            // The loop may be in its 30 s sleep: refresh now if the last probe is stale.
+            if Date().timeIntervalSince(lastLocalRefresh) > 10 {
+                lastLocalRefresh = Date()
+                Task { [registry] in await registry.refreshLocal() }
+            }
+            return
+        }
         localRefresh = Task { [weak self, registry] in
             while let deadline = self?.localRefreshDeadline, Date() < deadline {
+                self?.lastLocalRefresh = Date()
                 await registry.refreshLocal()
                 try? await Task.sleep(nanoseconds: 30_000_000_000)
             }
@@ -190,9 +199,10 @@ final class AppState {
         providers.map { ModelGroup(id: $0.config.id, name: $0.config.name, isLocal: $0.config.isLocal, models: $0.models.filter(Self.canChat)) }
     }
 
-    /// Embedding-only models (bge-m3, nomic-embed-text…) can't hold a chat.
+    /// Embedding-only and other non-chat models (bge-m3, image generators)
+    /// can't hold a chat; chat models stream text.
     static func canChat(_ model: ModelInfo) -> Bool {
-        !(model.capabilities.contains(.embeddings) && !model.capabilities.contains(.streaming))
+        model.capabilities.contains(.streaming)
     }
 
     func resolvedDefaultModel() async -> ModelRef? {

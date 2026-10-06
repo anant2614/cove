@@ -89,10 +89,15 @@ final class ChatViewModel {
     /// reasoning settings only on some models.)
     var modelThinks: Bool { isLocalModel && (modelInfo?.capabilities.contains(.reasoning) ?? false) }
 
-    /// Whether the next reply thinks first (mirrors the engine). Off by
+    /// Whether the next reply thinks first, by the engine's own rule. Off by
     /// default: a 9B model can think for minutes before answering on a laptop.
     var thinkingEnabled: Bool {
-        get { modelThinks && (thinkingOverride ?? false) }
+        get {
+            guard modelThinks else { return false }
+            let effort = ConversationEngine.reasoningEffort(options: SendOptions(thinking: thinkingOverride), model: modelInfo,
+                                                            isLocal: isLocalModel, configured: app.settings.engine.parameters.reasoningEffort)
+            return effort.map { $0 != .minimal } ?? false
+        }
         set { thinkingOverride = newValue }
     }
 
@@ -137,10 +142,11 @@ final class ChatViewModel {
     // MARK: Actions
 
     func setModel(_ model: ModelRef?) {
-        guard model != chat?.model else { return }
+        // The defaults depend on the model, so a new model starts from them;
+        // re-picking the same one keeps the user's toggles. Always saved, as
+        // another window may have changed this chat's model meanwhile.
+        if model != chat?.model { app.chatChoices[chatID] = nil }
         chat?.model = model
-        // The defaults depend on the model, so a new model starts from them.
-        app.chatChoices[chatID] = nil
         Task { try? await app.store.chats.setModel(id: chatID, model) }
     }
 

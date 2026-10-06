@@ -122,9 +122,13 @@ public struct ModelInfo: Codable, Sendable, Hashable, Identifiable {
     /// Estimated memory a local model takes once loaded (weights plus its KV
     /// cache at `contextWindow`); nil when unknown.
     public var memoryBytes: Int64?
+    /// Identifies this exact build of a local model (Ollama's digest), so
+    /// info about one build is never reused for a re-pulled one.
+    public var revision: String?
 
     public init(id: String, providerID: ProviderID, displayName: String? = nil, contextWindow: Int? = nil,
-                capabilities: ProviderCapabilities = .standard, isLocal: Bool = false, memoryBytes: Int64? = nil) {
+                capabilities: ProviderCapabilities = .standard, isLocal: Bool = false, memoryBytes: Int64? = nil,
+                revision: String? = nil) {
         self.id = id
         self.providerID = providerID
         self.displayName = displayName ?? id
@@ -132,6 +136,7 @@ public struct ModelInfo: Codable, Sendable, Hashable, Identifiable {
         self.capabilities = capabilities
         self.isLocal = isLocal
         self.memoryBytes = memoryBytes
+        self.revision = revision
     }
 
     public var ref: ModelRef { ModelRef(providerID: providerID, modelID: id) }

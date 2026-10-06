@@ -100,7 +100,7 @@ final class ProviderRegistryTests: XCTestCase {
     private func makeRegistry(http: SwitchableOllama) throws -> ProviderRegistry {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         return ProviderRegistry(store: try CoveStore.inMemory(attachmentsDirectory: dir), secrets: InMemorySecretStore(), http: http,
-                                discovery: LocalModelDiscovery(http: http, timeout: 0.2))
+                                discovery: LocalModelDiscovery(http: http, timeout: 0.2), physicalMemory: 16 << 30)
     }
 
     func testSlowServerSurvivesMissedProbes() async throws {

@@ -86,9 +86,10 @@ final class LocalProviderTests: XCTestCase {
         XCTAssertEqual(ollama.models.map(\.id), ["llama3.2:3b", "llava:7b"])
         XCTAssertTrue(ollama.models.allSatisfy { $0.isLocal && $0.providerID == .ollama })
         let urls = Set(http.requests.map(\.url.absoluteString))
-        XCTAssertEqual(urls, ["http://localhost:11434/api/tags", "http://localhost:11434/api/show", "http://localhost:1234/v1/models"])
+        XCTAssertEqual(urls, ["http://localhost:11434/api/tags", "http://localhost:11434/api/version",
+                              "http://localhost:11434/api/show", "http://localhost:1234/v1/models"])
         // Probes are quick; per-model details get longer once Ollama is known to be up.
-        XCTAssertTrue(http.requests.filter { $0.url.path != "/api/show" }.allSatisfy { $0.timeout <= 1 })
+        XCTAssertTrue(http.requests.filter { $0.url.path != "/api/show" }.allSatisfy { $0.timeout <= LocalModelDiscovery.transportTimeout(1) })
     }
 
     func testDiscoveryLMStudioUpOllamaTooSlow() async throws {

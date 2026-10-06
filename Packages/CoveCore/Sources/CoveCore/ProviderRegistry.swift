@@ -35,6 +35,10 @@ public actor ProviderRegistry: ProviderResolving {
     private var instances: [ProviderID: any LLMProvider] = [:]
     /// Probes in a row that a previously found local server has not answered.
     private var missedProbes: [ProviderID: Int] = [:]
+    /// Follow-up probes scheduled for models whose details couldn't be read yet.
+    private var detailRetries = 0
+    static let maxDetailRetries = 3
+    static let detailRetryDelay: UInt64 = 8_000_000_000
     private var observers: [UUID: @Sendable () -> Void] = [:]
 
     public init(store: CoveStore, secrets: any SecretStore, http: any HTTPClient = URLSessionHTTPClient(),
@@ -66,14 +70,18 @@ public actor ProviderRegistry: ProviderResolving {
     static let missedProbesBeforeRemoval = 3
 
     /// Probes Ollama and LM Studio. Returns true if anything changed.
+    /// - Parameter countingMisses: false for probes made on the send path,
+    ///   which must not push a slow server toward removal.
     @discardableResult
-    public func refreshLocal() async -> Bool {
+    public func refreshLocal(countingMisses: Bool = true) async -> Bool {
         let result = await discovery.probe()
         // A cancelled probe (e.g. the model picker closed) learned nothing.
         guard !Task.isCancelled else { return false }
         let found = result.servers
         let previous = Set(local.map(\.id))
         let previousModels = local.map { models[$0.id] ?? [] }
+        let previousErrors = errors
+        var unknownDetails = false
         var next = found.map(\.config)
         for server in found {
             let id = server.config.id
@@ -81,12 +89,16 @@ public actor ProviderRegistry: ProviderResolving {
             // A model whose details couldn't be read this time keeps what was
             // known about it, rather than name-based guesses.
             models[id] = server.models.map { model in
-                server.modelsMissingDetails.contains(model.id) ? (before[model.id] ?? model) : model
+                guard server.modelsMissingDetails.contains(model.id) else { return model }
+                if let known = before[model.id], known.revision == model.revision { return known }
+                unknownDetails = true
+                return model
             }
             missedProbes[id] = nil
             errors[id] = nil
         }
         for config in local where !found.contains(where: { $0.config.id == config.id }) {
+            guard countingMisses || result.down.contains(config.id) else { next.append(config); continue }
             let misses = (missedProbes[config.id] ?? 0) + 1
             // A refused connection means it isn't running: drop it now. Only a
             // timed-out (slow) server gets the grace period.
@@ -104,9 +116,22 @@ public actor ProviderRegistry: ProviderResolving {
         }
         local = next.sorted { Self.localRank($0.id) < Self.localRank($1.id) }
         let changed = previous != Set(local.map(\.id)) || previousModels != local.map { models[$0.id] ?? [] }
-            || !missedProbes.isEmpty
+            || previousErrors != errors
         if changed { notify() }
+        if unknownDetails { scheduleDetailRetry() } else { detailRetries = 0 }
         return changed
+    }
+
+    /// A model seen for the first time whose details couldn't be read (e.g.
+    /// at launch while the Mac is busy) only has guesses; look again shortly
+    /// rather than waiting for the model picker to open.
+    private func scheduleDetailRetry() {
+        guard detailRetries < Self.maxDetailRetries else { return }
+        detailRetries += 1
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.detailRetryDelay)
+            await self?.refreshLocal()
+        }
     }
 
     /// Ollama first, then LM Studio (the order discovery reports them in).
@@ -232,7 +257,7 @@ public actor ProviderRegistry: ProviderResolving {
         // An unlisted local model (pulled since the last probe?): look again,
         // since this number is sent as num_ctx and a trained maximum (128K)
         // would allocate far more KV cache than the Mac has.
-        await refreshLocal()
+        await refreshLocal(countingMisses: false)
         if let known = models[model.providerID]?.first(where: { $0.id == model.modelID })?.contextWindow { return known }
         return min(KnownModels.contextWindow(for: model.modelID) ?? KnownModels.defaultLocalContextWindow,
                    KnownModels.defaultLocalContextWindow)
@@ -266,7 +291,7 @@ public actor ProviderRegistry: ProviderResolving {
         let answering = local.filter { (missedProbes[$0.id] ?? 0) == 0 }
         let servers = answering.isEmpty ? local : answering
         let candidates = servers.flatMap { models[$0.id] ?? [] }
-            .filter { !$0.capabilities.contains(.embeddings) && !$0.id.lowercased().contains("embed") }
+            .filter { $0.capabilities.contains(.streaming) && !$0.id.lowercased().contains("embed") }
         let budget = Int64(Double(physicalMemory) * Self.unpromptedModelMemoryShare)
         let known = candidates.filter { $0.memoryBytes != nil }
         if let fits = known.filter({ $0.memoryBytes! <= budget }).max(by: { $0.memoryBytes! < $1.memoryBytes! }) { return fits }
@@ -295,7 +320,7 @@ public actor ProviderRegistry: ProviderResolving {
         if found == nil, Self.isLocalServerID(id) {
             // The server may have started after Cove, or been dropped after
             // missed probes: look again before failing the request.
-            await refreshLocal()
+            await refreshLocal(countingMisses: false)
             found = config(for: id)
         }
         guard let config = found else {

@@ -94,16 +94,27 @@ public actor LocalModelDiscovery {
     /// Longer than the probe timeout: the server is known to be up, and the
     /// details decide tool support and the context size.
     static let ollamaDetailsTimeout: TimeInterval = 2
+    /// Budget for the verbose shape fetch (older Ollama only), kept short:
+    /// discovery waits for it, and a miss is retried later.
+    static let ollamaShapeTimeout: TimeInterval = 4
+
+    /// Request timeout for a probe: past the probe's own deadline, so a slow
+    /// answer shows up as a timeout and only an immediate error as "down".
+    static func transportTimeout(_ deadline: TimeInterval) -> TimeInterval { deadline * 2 + 1 }
 
     static func probeOllama(http: any HTTPClient, baseURL: URL, timeout: TimeInterval) async -> TimedOutcome<DiscoveredLocalServer> {
         let client = OllamaNativeClient(baseURL: baseURL, http: http)
         let models: [OllamaModel]
-        switch await bounded(timeout, { try await client.tags(timeout: timeout) }) {
+        // The request may run longer than the deadline, so a slow server is
+        // reported as timed out (kept for now) rather than failed (dropped).
+        switch await bounded(timeout, { try await client.tags(timeout: transportTimeout(timeout)) }) {
         case .value(let listed): models = listed
         case .failed: return .failed
         case .timedOut: return .timedOut
         }
-        let details = await client.details(for: models, timeout: max(timeout, ollamaDetailsTimeout))
+        let detailsTimeout = max(timeout, ollamaDetailsTimeout)
+        let version = await withTimeout(timeout) { try await client.version(timeout: transportTimeout(timeout)) } ?? nil
+        let details = await client.details(for: models, timeout: detailsTimeout, shapeTimeout: ollamaShapeTimeout, serverVersion: version)
         let config = ProviderConfig(id: .ollama, kind: .ollama, name: "Ollama", baseURL: baseURL)
         return .value(DiscoveredLocalServer(
             config: config,
@@ -113,7 +124,7 @@ public actor LocalModelDiscovery {
     }
 
     static func probeLMStudio(http: any HTTPClient, baseURL: URL, timeout: TimeInterval) async throws -> DiscoveredLocalServer {
-        let request = HTTPRequest(url: try ProviderSupport.url(baseURL, "models"), timeout: timeout)
+        let request = HTTPRequest(url: try ProviderSupport.url(baseURL, "models"), timeout: transportTimeout(timeout))
         let json = try await ProviderSupport.fetchJSON(http, request)
         guard let data = json["data"]?.arrayValue else {
             throw ProviderError.invalidResponse("Missing model list")

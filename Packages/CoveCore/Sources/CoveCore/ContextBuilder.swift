@@ -69,21 +69,29 @@ public struct ContextBuilder: Sendable {
         // user messages with their time note.
         let usable = input.history.filter(Self.isSendable).map { Self.outgoing($0, note: input.userMessageNote) }
         var turns = Self.turns(of: usable)
-        if let newest = turns.last { turns[turns.count - 1] = Self.fitting(newest, budget: budget) }
+        if let newest = turns.last {
+            // When the newest turn has its own large tool output, leave room
+            // for the previous exchange in short form, so a follow-up still
+            // has the conversation it follows (up to a quarter of the budget).
+            var room = budget
+            if turns.count > 1 {
+                let previous = Self.cost(of: Self.withToolOutputOmitted(turns[turns.count - 2]))
+                if previous <= budget / 4 { room -= previous }
+            }
+            turns[turns.count - 1] = Self.fitting(newest, budget: room)
+        }
         var included: [[Message]] = []
         var used = 0
         for turn in turns.reversed() {
             var candidate = turn
-            var cost = Self.cost(of: candidate)
-            if !included.isEmpty && used + cost > budget {
+            if !included.isEmpty && used + Self.cost(of: candidate) > budget {
                 // Keep the earlier exchange (question, calls, answers) and drop
-                // only its bulky tool output; the follow-up usually refers to it.
-                candidate = Self.withToolOutputOmitted(turn)
-                cost = Self.cost(of: candidate)
-                if used + cost > budget { break }
+                // only as much of its bulky tool output as needed, largest first.
+                candidate = Self.shrinkingToolOutput(turn, toFit: budget - used)
+                if used + Self.cost(of: candidate) > budget { break }
             }
             included.insert(candidate, at: 0)
-            used += cost
+            used += Self.cost(of: candidate)
         }
         let messages = included.flatMap { $0 }
 
@@ -166,66 +174,98 @@ public struct ContextBuilder: Sendable {
     /// The turn with every tool result replaced by a short stub. Calls and
     /// results stay paired, so providers still accept the history.
     static func withToolOutputOmitted(_ turn: [Message]) -> [Message] {
-        turn.map { message in
-            var message = message
-            message.content = message.content.map { part in
-                guard case .toolResult(var result) = part else { return part }
-                result.text = omittedToolOutput
-                result.images = []
-                return .toolResult(result)
-            }
-            return message
-        }
+        var turn = turn
+        for slot in toolResultSlots(turn) { stub(slot, in: &turn) }
+        return turn
     }
 
-    /// Shortens the tool results in `turn` until it fits `budget`: the largest
-    /// results are cut first, down to a common cap. If even
-    /// `minimumToolResultTokens` per result doesn't fit, the oldest results are
-    /// replaced by a stub, newest last. Fetched pages are the usual cause of a
-    /// single turn outgrowing a small local context; without this the server
-    /// would cut the start of the prompt instead, or reject the request.
+    /// Replaces tool results with the stub, largest first, until the turn
+    /// costs at most `budget` (or there is nothing left worth stubbing).
+    static func shrinkingToolOutput(_ turn: [Message], toFit budget: Int) -> [Message] {
+        var turn = turn
+        let stubCost = TokenEstimator.estimate(omittedToolOutput)
+        let bySize = toolResultSlots(turn).sorted { TokenEstimator.estimate(text($0, in: turn)) > TokenEstimator.estimate(text($1, in: turn)) }
+        for slot in bySize where cost(of: turn) > budget {
+            guard TokenEstimator.estimate(text(slot, in: turn)) > stubCost else { break }
+            stub(slot, in: &turn)
+        }
+        return turn
+    }
+
+    /// Shortens the tool results in `turn` until it fits `budget`: results
+    /// over a common cap are cut to it, the largest first. If even
+    /// `minimumToolResultTokens` per result doesn't fit, older results are
+    /// replaced by a stub (oldest first, skipping ones smaller than the stub),
+    /// keeping the newest. Fetched pages are the usual cause of a single turn
+    /// outgrowing a small local context; without this the server would cut
+    /// the start of the prompt instead, or reject the request.
     static func fitting(_ turn: [Message], budget: Int) -> [Message] {
         var turn = turn
         guard cost(of: turn) > budget else { return turn }
-        // (message, part) positions of tool results, oldest first.
+        let slots = toolResultSlots(turn)
+        guard !slots.isEmpty else { return turn }
+        let noteCost = TokenEstimator.estimate(toolResultTrimNote)
+        let stubCost = TokenEstimator.estimate(omittedToolOutput)
+        var stubbed: Set<Int> = []
+        while true {
+            let open = slots.indices.filter { !stubbed.contains($0) }.map { slots[$0] }
+            let sizes = open.map { TokenEstimator.estimate(text($0, in: turn)) }
+            let room = budget - (cost(of: turn) - sizes.reduce(0, +))
+            if sizes.reduce(0, +) <= room { return turn }
+            // Cost of capping every open result at c; monotone in c (a result
+            // is only cut when that makes it cheaper, note included).
+            func needed(_ c: Int) -> Int { sizes.reduce(0) { $0 + min($1, c + noteCost) } }
+            if needed(minimumToolResultTokens) <= room || open.count == 1 {
+                var low = 0, high = sizes.max() ?? 0
+                while low < high {
+                    let mid = (low + high + 1) / 2
+                    if needed(mid) <= room { low = mid } else { high = mid - 1 }
+                }
+                for (slot, size) in zip(open, sizes) where size > low + noteCost {
+                    let characters = Int(Double(low) * TokenEstimator.charactersPerToken / TokenEstimator.safetyMargin)
+                    setText(String(text(slot, in: turn).prefix(characters)) + toolResultTrimNote, at: slot, in: &turn)
+                }
+                return turn
+            }
+            // Floors don't fit: stub the oldest result that is worth stubbing.
+            guard let next = slots.indices.dropLast().first(where: {
+                !stubbed.contains($0) && TokenEstimator.estimate(text(slots[$0], in: turn)) > stubCost
+            }) else {
+                // Nothing older is worth stubbing: cut everything to what fits.
+                stubbed = Set(slots.indices.dropLast())
+                for index in stubbed where TokenEstimator.estimate(text(slots[index], in: turn)) > stubCost { stub(slots[index], in: &turn) }
+                continue
+            }
+            stub(slots[next], in: &turn)
+            stubbed.insert(next)
+        }
+    }
+
+    /// (message, part) positions of the tool results in `turn`, oldest first.
+    private static func toolResultSlots(_ turn: [Message]) -> [(Int, Int)] {
         var slots: [(Int, Int)] = []
         for (m, message) in turn.enumerated() {
             for (p, part) in message.content.enumerated() { if case .toolResult = part { slots.append((m, p)) } }
         }
-        guard !slots.isEmpty else { return turn }
-        let noteCost = TokenEstimator.estimate(toolResultTrimNote)
-        func text(_ slot: (Int, Int)) -> String {
-            if case .toolResult(let result) = turn[slot.0].content[slot.1] { return result.text }
-            return ""
-        }
-        func setText(_ slot: (Int, Int), _ value: String) {
-            guard case .toolResult(var result) = turn[slot.0].content[slot.1] else { return }
-            result.text = value
-            turn[slot.0].content[slot.1] = .toolResult(result)
-        }
-        var stubbed = 0
-        while true {
-            let open = Array(slots[stubbed...])
-            let sizes = open.map { TokenEstimator.estimate(text($0)) }
-            let room = budget - (cost(of: turn) - sizes.reduce(0, +))
-            // Largest cap c with Σ min(size, c) (+ note when cut) ≤ room.
-            func needed(_ c: Int) -> Int { sizes.reduce(0) { $0 + ($1 > c ? c + noteCost : $1) } }
-            var low = 0, high = sizes.max() ?? 0
-            while low < high {
-                let mid = (low + high + 1) / 2
-                if needed(mid) <= room { low = mid } else { high = mid - 1 }
-            }
-            let cap = needed(low) <= room ? low : 0
-            if cap >= minimumToolResultTokens || open.count == 1 {
-                for (slot, size) in zip(open, sizes) where size > cap {
-                    let characters = Int(Double(cap) * TokenEstimator.charactersPerToken / TokenEstimator.safetyMargin)
-                    setText(slot, String(text(slot).prefix(characters)) + toolResultTrimNote)
-                }
-                return turn
-            }
-            setText(slots[stubbed], omittedToolOutput)
-            stubbed += 1
-        }
+        return slots
+    }
+
+    private static func text(_ slot: (Int, Int), in turn: [Message]) -> String {
+        if case .toolResult(let result) = turn[slot.0].content[slot.1] { return result.text }
+        return ""
+    }
+
+    private static func setText(_ value: String, at slot: (Int, Int), in turn: inout [Message]) {
+        guard case .toolResult(var result) = turn[slot.0].content[slot.1] else { return }
+        result.text = value
+        turn[slot.0].content[slot.1] = .toolResult(result)
+    }
+
+    private static func stub(_ slot: (Int, Int), in turn: inout [Message]) {
+        guard case .toolResult(var result) = turn[slot.0].content[slot.1] else { return }
+        result.text = omittedToolOutput
+        result.images = []
+        turn[slot.0].content[slot.1] = .toolResult(result)
     }
 
     /// Splits history into turns that each start at a user message, so tool

@@ -159,7 +159,9 @@ final class FetchURLToolTests: XCTestCase {
                     "https://docs.google.com/document/d/abc/edit?usp=sharing"] {
             XCTAssertFalse(FetchURLTool.isSearchResultsPage(URL(string: url)!), url)
         }
-        for url in ["https://search.yahoo.com/search?p=x", "https://search.brave.com/search?q=x", "https://yandex.ru/search/?text=x",
+        for url in ["https://duckduckgo.com?q=x", "https://www.google.com?q=x", "https://uk.search.yahoo.com/search?p=x",
+                    "https://cn.bing.com/search?q=x",
+                    "https://search.yahoo.com/search?p=x", "https://search.brave.com/search?q=x", "https://yandex.ru/search/?text=x",
                     "https://www.baidu.com/s?wd=x", "https://scholar.google.com/scholar?q=x"] {
             XCTAssertTrue(FetchURLTool.isSearchResultsPage(URL(string: url)!), url)
         }

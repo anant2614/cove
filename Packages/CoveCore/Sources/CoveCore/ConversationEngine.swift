@@ -184,7 +184,7 @@ public final class ConversationEngine: Sendable {
     /// Whether tools are offered for this send: never to a model that can't
     /// use them; otherwise the user's choice, defaulting to off only for
     /// models that would call a tool for every message.
-    static func offersTools(options: SendOptions, model: ModelInfo?, provider: ProviderCapabilities) -> Bool {
+    public static func offersTools(options: SendOptions, model: ModelInfo?, provider: ProviderCapabilities) -> Bool {
         let supported = model.map { $0.capabilities.contains(.tools) } ?? provider.contains(.tools)
         guard supported else { return false }
         return options.toolsEnabled ?? !(model?.capabilities.contains(.eagerToolCalls) ?? false)
@@ -199,7 +199,7 @@ public final class ConversationEngine: Sendable {
     /// some models (gpt-4o rejects `reasoning_effort`, o-series rejects
     /// "minimal", most Claude models reject a thinking budget), and their
     /// capabilities are known per provider, not per model.
-    static func reasoningEffort(options: SendOptions, model: ModelInfo?, isLocal: Bool, configured: ReasoningEffort?) -> ReasoningEffort? {
+    public static func reasoningEffort(options: SendOptions, model: ModelInfo?, isLocal: Bool, configured: ReasoningEffort?) -> ReasoningEffort? {
         guard isLocal, let model, model.capabilities.contains(.reasoning) else { return configured }
         switch options.thinking {
         case .some(true): return configured.flatMap { $0 == .minimal ? nil : $0 } ?? .medium

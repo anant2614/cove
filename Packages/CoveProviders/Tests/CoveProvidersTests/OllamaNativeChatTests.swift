@@ -156,7 +156,8 @@ final class OllamaNativeChatTests: XCTestCase {
         // the 8 global layers (1 KV head, 512-wide) grow with the context.
         let gemma = try details("ollama/show_gemma4.json")
         XCTAssertEqual(gemma.kvBytesPerToken, 8 * 1 * (512 + 512) * 2)
-        XCTAssertEqual(gemma.fixedKVBytes, 40 * 8 * (256 + 256) * 2 * 1_024)
+        // llama.cpp keeps window + one 512-token micro-batch per sliding layer (1,536 cells).
+        XCTAssertEqual(gemma.fixedKVBytes, 40 * 8 * (256 + 256) * 2 * 1_536)
         XCTAssertFalse(gemma.forcesToolCalls)
         let model = OllamaModel(name: "gemma4:12b", size: 7_982_000_000)
         XCTAssertEqual(OllamaProvider.contextLength(for: model, details: gemma, physicalMemory: 16 * Self.gib), 32_768,
@@ -164,7 +165,7 @@ final class OllamaNativeChatTests: XCTestCase {
         let info = OllamaProvider.modelInfo(model, details: gemma, providerID: .ollama, physicalMemory: 16 * Self.gib)
         let weights: Int64 = 7_982_000_000
         let perTokenKV: Int64 = 32_768 * 16_384
-        let slidingKV: Int64 = 40 * 8 * 512 * 2 * 1_024
+        let slidingKV: Int64 = 40 * 8 * 512 * 2 * 1_536
         XCTAssertEqual(info.memoryBytes, weights + perTokenKV + slidingKV,
                        "weights + per-token KV at the chosen context + the sliding-window cache")
         let unknownSize = OllamaProvider.modelInfo(OllamaModel(name: "x", size: 0), details: gemma, providerID: .ollama)
@@ -220,7 +221,15 @@ final class OllamaNativeChatTests: XCTestCase {
         // Gemma 3 GGUFs have a window but no pattern key: one global layer in six.
         let gemma3 = try details(#""general.architecture":"gemma3","gemma3.block_count":48,"gemma3.attention.head_count":16,"gemma3.attention.head_count_kv":8,"gemma3.attention.key_length":256,"gemma3.attention.value_length":256,"gemma3.attention.sliding_window":1024,"gemma3.context_length":131072"#)
         XCTAssertEqual(gemma3.kvBytesPerToken, 8 * 8 * 512 * 2)
-        XCTAssertEqual(gemma3.fixedKVBytes, 40 * 8 * 512 * 2 * 1_024)
+        XCTAssertEqual(gemma3.fixedKVBytes, 40 * 8 * 512 * 2 * 1_536)
+        XCTAssertEqual(OllamaProvider.contextLength(for: OllamaModel(name: "gemma3:12b", size: 8_149_190_253), details: gemma3,
+                                                    physicalMemory: 16 * Self.gib), 32_768, "the one-in-six layout leaves room for 32K")
+        // The other architectures llama.cpp hard-codes, by Ollama's architecture names.
+        let gemma2 = try details(#""general.architecture":"gemma2","gemma2.block_count":4,"gemma2.attention.head_count_kv":1,"gemma2.attention.key_length":64,"gemma2.attention.sliding_window":4096"#)
+        XCTAssertEqual(gemma2.kvBytesPerToken, 2 * 1 * 128 * 2, "alternating: layers 1 and 3 are global")
+        let gptoss = try details(#""general.architecture":"gptoss","gptoss.block_count":4,"gptoss.attention.head_count_kv":1,"gptoss.attention.key_length":64,"gptoss.attention.sliding_window":128"#)
+        XCTAssertEqual(gptoss.kvBytesPerToken, 2 * 1 * 128 * 2)
+        XCTAssertEqual(OllamaModelDetails.slidingCacheCells(window: 128), 768)
         // An integer pattern period.
         let period = try details(#""general.architecture":"x","x.block_count":4,"x.attention.head_count_kv":2,"x.attention.key_length":64,"x.attention.sliding_window":128,"x.attention.sliding_window_pattern":2"#)
         XCTAssertEqual(period.kvBytesPerToken, 2 * 2 * 128 * 2)
