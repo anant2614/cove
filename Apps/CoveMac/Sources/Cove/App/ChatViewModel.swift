@@ -42,9 +42,15 @@ final class ChatViewModel {
 
     var draft = ""
     /// The user's tools choice for this chat; nil follows the model's default.
-    var toolsOverride: Bool?
+    var toolsOverride: Bool? {
+        get { app.chatChoices[chatID]?.tools }
+        set { app.chatChoices[chatID, default: ChatChoices()].tools = newValue }
+    }
     /// The user's thinking choice for this chat; nil follows the default.
-    var thinkingOverride: Bool?
+    var thinkingOverride: Bool? {
+        get { app.chatChoices[chatID]?.thinking }
+        set { app.chatChoices[chatID, default: ChatChoices()].thinking = newValue }
+    }
     var staged: [StagedAttachment] = []
     /// Set while editing an earlier user message.
     var editingMessageID: String?
@@ -78,13 +84,15 @@ final class ChatViewModel {
     /// start with tools off; the user can still turn them on.
     var toolsOffByDefault: Bool { modelInfo?.capabilities.contains(.eagerToolCalls) ?? false }
 
-    /// Whether the model can think before answering (shows the toggle).
-    var modelThinks: Bool { modelInfo?.capabilities.contains(.reasoning) ?? false }
+    /// Whether the thinking toggle applies: local models that can think.
+    /// (Cloud models keep their provider's default; their APIs accept
+    /// reasoning settings only on some models.)
+    var modelThinks: Bool { isLocalModel && (modelInfo?.capabilities.contains(.reasoning) ?? false) }
 
-    /// Whether the next reply thinks first. Off by default on local models:
-    /// a 9B model can think for minutes before answering on a laptop.
+    /// Whether the next reply thinks first (mirrors the engine). Off by
+    /// default: a 9B model can think for minutes before answering on a laptop.
     var thinkingEnabled: Bool {
-        get { modelThinks && (thinkingOverride ?? !isLocalModel) }
+        get { modelThinks && (thinkingOverride ?? false) }
         set { thinkingOverride = newValue }
     }
 
@@ -129,9 +137,10 @@ final class ChatViewModel {
     // MARK: Actions
 
     func setModel(_ model: ModelRef?) {
+        guard model != chat?.model else { return }
         chat?.model = model
-        toolsOverride = nil
-        thinkingOverride = nil
+        // The defaults depend on the model, so a new model starts from them.
+        app.chatChoices[chatID] = nil
         Task { try? await app.store.chats.setModel(id: chatID, model) }
     }
 
@@ -158,7 +167,8 @@ final class ChatViewModel {
 
     func regenerate(_ row: MessageRow, model: ModelRef? = nil) {
         guard !isStreaming else { return }
-        run(app.engine.regenerate(chatID: chatID, messageID: row.message.id, options: SendOptions(model: model, toolsEnabled: toolsOverride, thinking: thinkingOverride)))
+        run(app.engine.regenerate(chatID: chatID, messageID: row.message.id,
+                                  options: model.map { oneOffOptions($0) } ?? SendOptions(toolsEnabled: toolsOverride, thinking: thinkingOverride)))
     }
 
     func beginEdit(_ row: MessageRow) {
@@ -195,14 +205,22 @@ final class ChatViewModel {
         await reloadRows()
     }
 
+    /// Options for answering once with a different model: an explicit
+    /// "tools off" carries over; anything else uses that model's defaults
+    /// (turning thinking on for one model shouldn't make a local 9B model
+    /// think for minutes).
+    private func oneOffOptions(_ model: ModelRef) -> SendOptions {
+        SendOptions(model: model, toolsEnabled: toolsOverride == false ? false : nil)
+    }
+
     /// "Retry with a local model" after an offline/unreachable error (§18).
     func retryWithLocalModel(_ model: ModelRef) {
         error = nil
         if let lastUser = rows.last(where: { $0.message.role == .user }) {
             if let lastAssistant = rows.last, lastAssistant.message.role == .assistant {
-                run(app.engine.regenerate(chatID: chatID, messageID: lastAssistant.message.id, options: SendOptions(model: model)))
+                run(app.engine.regenerate(chatID: chatID, messageID: lastAssistant.message.id, options: oneOffOptions(model)))
             } else {
-                run(app.engine.continue(chatID: chatID, from: lastUser.message.id, options: SendOptions(model: model)))
+                run(app.engine.continue(chatID: chatID, from: lastUser.message.id, options: oneOffOptions(model)))
             }
         }
     }

@@ -20,17 +20,32 @@ private struct StubHTTP: HTTPClient {
 }
 
 /// An Ollama that can be switched off and on between probes.
+/// A local Ollama that can be up, stopped (refuses at once) or slow (answers
+/// after the probe has given up), with or without working `/api/show`.
 private final class SwitchableOllama: HTTPClient, @unchecked Sendable {
+    enum State { case up, down, slow }
     private let lock = NSLock()
-    private var up = true
-    func set(up: Bool) { lock.withLock { self.up = up } }
+    private var state = State.up
+    private var showWorks = true
+    // No digests, so the details cache never answers for /api/show.
+    var tags = #"{"models":[{"name":"qwen3.5:9b","model":"qwen3.5:9b","size":6600000000}]}"#
+
+    func set(_ state: State) { lock.withLock { self.state = state } }
+    func set(showWorks: Bool) { lock.withLock { self.showWorks = showWorks } }
 
     func data(for request: HTTPRequest) async throws -> (Data, HTTPResponseHead) {
-        let isUp = lock.withLock { up }
-        guard isUp, request.url.absoluteString.contains("localhost:11434/api/tags") else {
-            throw ProviderError.unreachable(request.url.host ?? "")
+        let (state, showWorks) = lock.withLock { (self.state, self.showWorks) }
+        let url = request.url.absoluteString
+        guard url.contains("localhost:11434") else { throw ProviderError.unreachable(request.url.host ?? "") }
+        switch state {
+        case .down: throw ProviderError.unreachable(request.url.host ?? "")
+        case .slow: try await Task.sleep(nanoseconds: 2_000_000_000)
+        case .up: break
         }
-        return (Data(#"{"models":[{"name":"qwen3.5:9b","model":"qwen3.5:9b"}]}"#.utf8), HTTPResponseHead(statusCode: 200))
+        if url.hasSuffix("/api/tags") { return (Data(tags.utf8), HTTPResponseHead(statusCode: 200)) }
+        guard url.hasSuffix("/api/show"), showWorks else { throw ProviderError.http(status: 500, message: "busy") }
+        let show = #"{"capabilities":["completion","tools","thinking"],"template":"","model_info":{}}"#
+        return (Data(show.utf8), HTTPResponseHead(statusCode: 200))
     }
 
     func lines(for request: HTTPRequest) async throws -> (HTTPResponseHead, AsyncThrowingStream<String, Error>) {
@@ -85,32 +100,43 @@ final class ProviderRegistryTests: XCTestCase {
     private func makeRegistry(http: SwitchableOllama) throws -> ProviderRegistry {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         return ProviderRegistry(store: try CoveStore.inMemory(attachmentsDirectory: dir), secrets: InMemorySecretStore(), http: http,
-                                discovery: LocalModelDiscovery(http: http))
+                                discovery: LocalModelDiscovery(http: http, timeout: 0.2))
     }
 
-    func testLocalServerSurvivesMissedProbes() async throws {
+    func testSlowServerSurvivesMissedProbes() async throws {
         let http = SwitchableOllama()
         let registry = try makeRegistry(http: http)
         await registry.load()
         let model = ModelRef(providerID: .ollama, modelID: "qwen3.5:9b")
 
-        // A slow or missed probe (e.g. while the Mac is swapping) must not drop Ollama.
-        http.set(up: false)
+        // Slow answers (e.g. while the Mac is swapping) must not drop Ollama.
+        http.set(.slow)
         for _ in 1..<ProviderRegistry.missedProbesBeforeRemoval {
             await registry.refreshLocal()
-            let models = await registry.snapshot().first { $0.id == .ollama }?.models.map(\.id)
-            XCTAssertEqual(models, ["qwen3.5:9b"])
+            let ollama = await registry.snapshot().first { $0.id == .ollama }
+            XCTAssertEqual(ollama?.models.map(\.id), ["qwen3.5:9b"])
+            XCTAssertEqual(ollama?.lastError, "Not responding")
             _ = try await registry.provider(for: model)
         }
-        // Gone for several probes in a row: dropped.
+        // Silent for several probes in a row: dropped.
         await registry.refreshLocal()
         let afterRemoval = await registry.snapshot()
         XCTAssertFalse(afterRemoval.contains { $0.id == .ollama })
     }
 
+    func testStoppedServerIsDroppedAtOnce() async throws {
+        let http = SwitchableOllama()
+        let registry = try makeRegistry(http: http)
+        await registry.load()
+        http.set(.down)  // quit: the port refuses connections
+        await registry.refreshLocal()
+        let snapshot = await registry.snapshot()
+        XCTAssertFalse(snapshot.contains { $0.id == .ollama })
+    }
+
     func testDroppedLocalServerIsProbedAgainWhenAChatNeedsIt() async throws {
         let http = SwitchableOllama()
-        http.set(up: false)
+        http.set(.down)
         let registry = try makeRegistry(http: http)
         await registry.load()  // Cove started before Ollama
         let model = ModelRef(providerID: .ollama, modelID: "qwen3.5:9b")
@@ -123,9 +149,37 @@ final class ProviderRegistryTests: XCTestCase {
         let isLocal = await registry.isLocal(.ollama)
         XCTAssertTrue(isLocal, "Ollama counts as local even while it isn't answering")
 
-        http.set(up: true)  // Ollama started; no model-picker refresh happened
+        http.set(.up)  // Ollama started; no model-picker refresh happened
         let provider = try await registry.provider(for: model)
         XCTAssertEqual(provider.id, .ollama)
+    }
+
+    func testModelInfoSurvivesAFailedShow() async throws {
+        let http = SwitchableOllama()
+        let registry = try makeRegistry(http: http)
+        await registry.load()
+        let ref = ModelRef(providerID: .ollama, modelID: "qwen3.5:9b")
+        let before = await registry.modelInfo(for: ref)
+        XCTAssertTrue(before?.capabilities.contains(.reasoning) ?? false)
+
+        http.set(showWorks: false)  // /api/show fails this time
+        await registry.refreshLocal()
+        let after = await registry.modelInfo(for: ref)
+        XCTAssertEqual(after, before, "a failed read keeps what was known instead of name-based guesses")
+    }
+
+    func testDefaultSkipsEmbeddingModelsAndUnlistedModelsGetASafeContext() async throws {
+        let http = SwitchableOllama()
+        http.tags = #"{"models":[{"name":"big:12b","size":9500000000,"capabilities":["completion","tools"]},"#
+            + #"{"name":"bge-m3:latest","size":1157672605,"capabilities":["embedding"]}]}"#
+        http.set(showWorks: false)
+        let registry = try makeRegistry(http: http)
+        await registry.load()
+        let chosen = await registry.defaultModel()
+        XCTAssertEqual(chosen?.modelID, "big:12b", "an embedding model is never a chat default")
+
+        let window = await registry.contextWindow(for: ModelRef(providerID: .ollama, modelID: "llama3.2:latest"))
+        XCTAssertLessThanOrEqual(window, KnownModels.defaultLocalContextWindow, "not the 128K it was trained for")
     }
 
     func testDefaultLocalModelFitsHalfOfMemory() async throws {

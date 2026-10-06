@@ -151,8 +151,17 @@ final class FetchURLToolTests: XCTestCase {
         }
         XCTAssertTrue(http.requests.isEmpty)
         // Ordinary pages on the same hosts are still fetchable.
-        for url in ["https://www.google.com", "https://blog.google/technology/ai/", "https://duckduckgo.com/about"] {
+        for url in ["https://www.google.com", "https://blog.google/technology/ai/", "https://duckduckgo.com/about",
+                    "https://developers.google.com/search/docs/crawling-indexing/robots/intro",
+                    "https://www.google.com/search/howsearchworks/", "https://support.google.com/mail/?p=BadCredentials",
+                    "https://news.google.com/rss/search?q=AI&hl=en-US", "https://www.bing.com/search?q=x&format=rss",
+                    "https://translate.google.com/?text=hola", "https://www.google.com/maps?q=paris",
+                    "https://docs.google.com/document/d/abc/edit?usp=sharing"] {
             XCTAssertFalse(FetchURLTool.isSearchResultsPage(URL(string: url)!), url)
+        }
+        for url in ["https://search.yahoo.com/search?p=x", "https://search.brave.com/search?q=x", "https://yandex.ru/search/?text=x",
+                    "https://www.baidu.com/s?wd=x", "https://scholar.google.com/scholar?q=x"] {
+            XCTAssertTrue(FetchURLTool.isSearchResultsPage(URL(string: url)!), url)
         }
     }
 

@@ -136,7 +136,7 @@ public final class ConversationEngine: Sendable {
     public func send(chatID: String, content: [ContentPart], attachmentIDs: [String] = [], options: SendOptions = .init()) -> AsyncThrowingStream<EngineEvent, Error> {
         makeStream { continuation in
             guard let chat = try await self.store.chat(id: chatID) else { throw EngineError.chatNotFound }
-            let user = Message(chatID: chatID, parentID: chat.headMessageID, role: .user, content: content)
+            let user = Message(chatID: chatID, parentID: chat.headMessageID, role: .user, content: content, createdAt: self.clock())
             try await self.persist(user, attachmentIDs: attachmentIDs, continuation: continuation)
             try await self.run(chatID: chatID, from: user.id, options: options, continuation: continuation)
         }
@@ -149,7 +149,7 @@ public final class ConversationEngine: Sendable {
             guard let original = try await self.store.message(id: userMessageID), original.role == .user else {
                 throw EngineError.messageNotFound
             }
-            let edited = Message(chatID: chatID, parentID: original.parentID, role: .user, content: newContent)
+            let edited = Message(chatID: chatID, parentID: original.parentID, role: .user, content: newContent, createdAt: self.clock())
             try await self.persist(edited, attachmentIDs: attachmentIDs, continuation: continuation)
             try await self.run(chatID: chatID, from: edited.id, options: options, continuation: continuation)
         }
@@ -193,39 +193,36 @@ public final class ConversationEngine: Sendable {
     /// The reasoning effort to request, or nil to leave the provider default.
     /// Measured on a 16 GB M4: qwen3.5 9B spent 409 s thinking (31K chars)
     /// before a 150-word answer, so local models think only when asked.
+    ///
+    /// Only local models are controlled: Ollama's `think` flag works for any
+    /// thinking model, whereas cloud APIs accept reasoning settings only on
+    /// some models (gpt-4o rejects `reasoning_effort`, o-series rejects
+    /// "minimal", most Claude models reject a thinking budget), and their
+    /// capabilities are known per provider, not per model.
     static func reasoningEffort(options: SendOptions, model: ModelInfo?, isLocal: Bool, configured: ReasoningEffort?) -> ReasoningEffort? {
-        guard model?.capabilities.contains(.reasoning) ?? true else { return configured }
+        guard isLocal, let model, model.capabilities.contains(.reasoning) else { return configured }
         switch options.thinking {
         case .some(true): return configured.flatMap { $0 == .minimal ? nil : $0 } ?? .medium
         case .some(false): return .minimal
-        case .none: return configured ?? (isLocal && model != nil ? .minimal : nil)
+        case .none: return configured ?? .minimal
         }
     }
 
-    /// Tells the model today's date. Models have no clock; without this,
-    /// questions about the date send them off fetching web pages. Only the
-    /// day goes in the system prompt so it stays identical all day and
-    /// servers can keep reusing their cached prompt prefix.
+    /// Tells the model today's date and how to read the time notes. Models
+    /// have no clock; without this, questions about the date or time send
+    /// them off fetching web pages. Nothing here changes during the day, so
+    /// servers can keep reusing their cached prompt prefix (re-reading a 6K
+    /// token chat took 14 s on a 3B model and 69 s on a 14B one).
     static func currentDateBlock(now: Date, timeZone: TimeZone) -> String {
-        "Today's date is \(format(now, "EEEE, d MMMM yyyy", timeZone)). The user is in the \(timeZone.identifier) time zone."
+        "Today's date is \(format(now, "EEEE, d MMMM yyyy", timeZone)). The user is in the \(timeZone.identifier) time zone. "
+            + "Each user message ends with when it was sent, like \"(sent Sun 4 Oct, 21:15)\"; that is already the "
+            + "user's local time, so don't convert it, and only mention it if it's relevant."
     }
 
-    /// The current time, appended to the newest user message only. In the
-    /// system prompt it would change every minute and force local servers to
-    /// re-read the whole chat (measured: 14 s for a 6K-token chat on a 3B
-    /// model, 69 s on a 14B one, vs. under 0.2 s with the cached prefix).
-    /// The wording keeps small models from volunteering the time or
-    /// "converting" it from UTC.
-    static func currentTimeNote(now: Date, timeZone: TimeZone) -> String {
-        "(Sent at \(format(now, "HH:mm", timeZone)), already in the user's local time; no conversion needed. Only mention it if relevant.)"
-    }
-
-    /// Adds `note` to the last user-typed message of `request`.
-    static func appendingToNewestUserMessage(_ note: String, in request: ChatRequest) -> ChatRequest {
-        var request = request
-        guard let index = request.messages.lastIndex(where: { $0.role == .user && $0.toolResults.isEmpty }) else { return request }
-        request.messages[index].content.append(.text(note))
-        return request
+    /// When a user message was sent, appended to it. Derived from the message
+    /// itself, so it reads the same in every later request.
+    static func sentNote(_ date: Date, timeZone: TimeZone) -> String {
+        "(sent \(format(date, "EEE d MMM, HH:mm", timeZone)))"
     }
 
     private static func format(_ date: Date, _ pattern: String, _ timeZone: TimeZone) -> String {
@@ -278,21 +275,22 @@ public final class ConversationEngine: Sendable {
 
         var leafID = startLeafID
         let maxSteps = max(1, settings.maxToolSteps)
+        // One clock reading per run, so every tool step sends identical text.
+        let now = clock(), zone = timeZone()
         for step in 0..<maxSteps {
             let history = try await store.path(to: leafID)
-            let now = clock(), zone = timeZone()
             var extra: [String] = [Self.currentDateBlock(now: now, timeZone: zone)]
             if !toolSpecs.isEmpty { extra.append(Self.toolUsePolicy) }
             if let offlineNotice { extra.append(offlineNotice) }
             if step == maxSteps - 1 && !toolSpecs.isEmpty {
                 extra.append("This is the final step: answer now without calling tools.")
             }
-            let (built, _) = try await contextBuilder.build(
+            let (request, _) = try await contextBuilder.build(
                 .init(model: model.modelID, systemPrompt: systemPrompt.isEmpty ? nil : systemPrompt, extraSystemBlocks: extra,
-                      history: history, tools: step == maxSteps - 1 ? [] : toolSpecs, parameters: parameters, contextWindow: contextWindow),
+                      history: history, tools: step == maxSteps - 1 ? [] : toolSpecs, parameters: parameters, contextWindow: contextWindow,
+                      userMessageNote: { Self.sentNote($0, timeZone: zone) }),
                 loadAttachment: { [store] id in try await store.attachmentData(id: id) }
             )
-            let request = Self.appendingToNewestUserMessage(Self.currentTimeNote(now: now, timeZone: zone), in: built)
 
             continuation.yield(.stepStarted(parentID: leafID, model: model))
             let outcome = await stream(provider: provider, request: request, continuation: continuation)

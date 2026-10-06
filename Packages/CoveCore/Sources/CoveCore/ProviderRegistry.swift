@@ -68,28 +68,43 @@ public actor ProviderRegistry: ProviderResolving {
     /// Probes Ollama and LM Studio. Returns true if anything changed.
     @discardableResult
     public func refreshLocal() async -> Bool {
-        let found = await discovery.discover()
+        let result = await discovery.probe()
+        // A cancelled probe (e.g. the model picker closed) learned nothing.
+        guard !Task.isCancelled else { return false }
+        let found = result.servers
         let previous = Set(local.map(\.id))
         let previousModels = local.map { models[$0.id] ?? [] }
         var next = found.map(\.config)
         for server in found {
-            models[server.config.id] = server.models
-            missedProbes[server.config.id] = nil
+            let id = server.config.id
+            let before = Dictionary((models[id] ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            // A model whose details couldn't be read this time keeps what was
+            // known about it, rather than name-based guesses.
+            models[id] = server.models.map { model in
+                server.modelsMissingDetails.contains(model.id) ? (before[model.id] ?? model) : model
+            }
+            missedProbes[id] = nil
+            errors[id] = nil
         }
         for config in local where !found.contains(where: { $0.config.id == config.id }) {
             let misses = (missedProbes[config.id] ?? 0) + 1
-            if misses >= Self.missedProbesBeforeRemoval {
+            // A refused connection means it isn't running: drop it now. Only a
+            // timed-out (slow) server gets the grace period.
+            if result.down.contains(config.id) || misses >= Self.missedProbesBeforeRemoval {
+                errors[config.id] = nil
                 missedProbes[config.id] = nil
                 models[config.id] = nil
                 instances[config.id] = nil
             } else {
                 // Keep it, with its last model list, until it misses a few more.
                 missedProbes[config.id] = misses
+                errors[config.id] = "Not responding"
                 next.append(config)
             }
         }
         local = next.sorted { Self.localRank($0.id) < Self.localRank($1.id) }
         let changed = previous != Set(local.map(\.id)) || previousModels != local.map { models[$0.id] ?? [] }
+            || !missedProbes.isEmpty
         if changed { notify() }
         return changed
     }
@@ -212,7 +227,15 @@ public actor ProviderRegistry: ProviderResolving {
 
     public func contextWindow(for model: ModelRef) async -> Int {
         if let known = models[model.providerID]?.first(where: { $0.id == model.modelID })?.contextWindow { return known }
-        return KnownModels.contextWindow(for: model.modelID, isLocal: config(for: model.providerID)?.isLocal ?? false)
+        let isLocal = config(for: model.providerID)?.isLocal ?? Self.isLocalServerID(model.providerID)
+        guard isLocal else { return KnownModels.contextWindow(for: model.modelID, isLocal: false) }
+        // An unlisted local model (pulled since the last probe?): look again,
+        // since this number is sent as num_ctx and a trained maximum (128K)
+        // would allocate far more KV cache than the Mac has.
+        await refreshLocal()
+        if let known = models[model.providerID]?.first(where: { $0.id == model.modelID })?.contextWindow { return known }
+        return min(KnownModels.contextWindow(for: model.modelID) ?? KnownModels.defaultLocalContextWindow,
+                   KnownModels.defaultLocalContextWindow)
     }
 
     public func fallbackLocalModel() async -> ModelRef? {
@@ -238,7 +261,12 @@ public actor ProviderRegistry: ProviderResolving {
     /// (size stands in for capability). Previously this was whichever model
     /// the server listed first, i.e. Ollama's most recently pulled one.
     func preferredLocalModel() -> ModelInfo? {
-        let candidates = local.flatMap { models[$0.id] ?? [] }.filter { !$0.id.lowercased().contains("embed") }
+        // Chat models only, on servers that are answering (fall back to a
+        // not-responding one only if nothing else is there).
+        let answering = local.filter { (missedProbes[$0.id] ?? 0) == 0 }
+        let servers = answering.isEmpty ? local : answering
+        let candidates = servers.flatMap { models[$0.id] ?? [] }
+            .filter { !$0.capabilities.contains(.embeddings) && !$0.id.lowercased().contains("embed") }
         let budget = Int64(Double(physicalMemory) * Self.unpromptedModelMemoryShare)
         let known = candidates.filter { $0.memoryBytes != nil }
         if let fits = known.filter({ $0.memoryBytes! <= budget }).max(by: { $0.memoryBytes! < $1.memoryBytes! }) { return fits }

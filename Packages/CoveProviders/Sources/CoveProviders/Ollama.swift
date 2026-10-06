@@ -15,10 +15,15 @@ public struct OllamaModel: Sendable, Hashable, Identifiable {
     /// All families reported (e.g. includes "clip" for vision models).
     public var families: [String]
     public var digest: String?
+    /// Capabilities listed by `/api/tags` (Ollama 0.35+; empty on older servers).
+    public var capabilities: [String]
+    /// Trained context length listed by `/api/tags` (Ollama 0.35+).
+    public var contextLength: Int?
     public var id: String { name }
 
     public init(name: String, size: Int64, parameterSize: String? = nil, quantization: String? = nil,
-                family: String? = nil, families: [String] = [], digest: String? = nil) {
+                family: String? = nil, families: [String] = [], digest: String? = nil,
+                capabilities: [String] = [], contextLength: Int? = nil) {
         self.name = name
         self.size = size
         self.parameterSize = parameterSize
@@ -26,6 +31,8 @@ public struct OllamaModel: Sendable, Hashable, Identifiable {
         self.family = family
         self.families = families
         self.digest = digest
+        self.capabilities = capabilities
+        self.contextLength = contextLength
     }
 }
 
@@ -125,9 +132,15 @@ public struct OllamaModelDetails: Sendable, Hashable {
         var withheld = false
         switch raw("attention.head_count_kv") {
         case .some(let heads) where heads.arrayValue != nil:
-            headsPerLayer = heads.arrayValue?.compactMap(\.intValue)
+            let perLayer = heads.arrayValue?.compactMap(\.intValue) ?? []
+            if perLayer.count == blocks, blocks > 0 { headsPerLayer = perLayer } else { withheld = true }
         case .some(let heads) where heads.intValue != nil:
-            headsPerLayer = heads.intValue.map { Array(repeating: $0, count: blocks) }
+            headsPerLayer = heads.intValue.map { n in
+                // Hybrid GGUFs may give one number plus the full-attention interval:
+                // only every k-th layer keeps a KV cache.
+                guard let k = value("full_attention_interval"), k > 1 else { return Array(repeating: n, count: blocks) }
+                return (0..<blocks).map { ($0 + 1) % k == 0 ? n : 0 }
+            }
         case .some(let heads) where heads.isNull:
             withheld = true
         default:
@@ -142,8 +155,8 @@ public struct OllamaModelDetails: Sendable, Hashable {
             let valueLength = value("attention.value_length") ?? keyLength
             // Sliding-window layers cache at most `window` tokens, whatever the context.
             let window = value("attention.sliding_window")
-            let pattern = raw("attention.sliding_window_pattern")?.arrayValue?.compactMap(\.boolValue)
-            let slides = window != nil && pattern?.count == headsPerLayer.count ? pattern! : Array(repeating: false, count: headsPerLayer.count)
+            let slides = Self.slidingLayers(count: headsPerLayer.count, window: window,
+                                            pattern: raw("attention.sliding_window_pattern"), architecture: arch)
             let keySWA = value("attention.key_length_swa") ?? keyLength
             let valueSWA = value("attention.value_length_swa") ?? valueLength
             var perToken = 0
@@ -167,19 +180,38 @@ public struct OllamaModelDetails: Sendable, Hashable {
         return details
     }
 
+    /// Every n-th layer attends globally, the rest over a sliding window, for
+    /// architectures whose GGUF has a window but no pattern key (llama.cpp
+    /// hard-codes these: gemma3 6, gemma2 and gpt-oss 2, cohere2 4).
+    static let defaultSlidingPattern: [String: Int] = ["gemma3": 6, "gemma3n": 6, "gemma2": 2, "gptoss": 2, "gpt-oss": 2, "cohere2": 4]
+
+    /// Which layers use the sliding window: an explicit per-layer pattern, an
+    /// integer period, or the architecture's known period. Unknown layouts
+    /// count every layer as global (overestimates memory, never underestimates).
+    static func slidingLayers(count: Int, window: Int?, pattern: JSONValue?, architecture: String?) -> [Bool] {
+        let none = Array(repeating: false, count: count)
+        guard let window, window > 0 else { return none }
+        if let flags = pattern?.arrayValue?.compactMap(\.boolValue), flags.count == count { return flags }
+        let period = pattern?.intValue ?? architecture.flatMap { defaultSlidingPattern[$0] }
+        guard let period, period > 1 else { return none }
+        return (0..<count).map { $0 % period < period - 1 }
+    }
+
     /// Some models report per-layer arrays (e.g. head_count_kv); size for the largest.
     private static func largest(_ value: JSONValue) -> Int? {
         value.intValue ?? value.arrayValue?.compactMap(\.intValue).max()
     }
 }
 
-/// KV-cache sizes read from verbose `/api/show`, keyed by server, model and
-/// digest (a re-pulled model gets a new digest).
-actor OllamaShapeCache {
-    static let shared = OllamaShapeCache()
-    private var shapes: [String: (perToken: Int, fixed: Int)] = [:]
-    func shape(for key: String) -> (perToken: Int, fixed: Int)? { shapes[key] }
-    func store(_ shape: (perToken: Int, fixed: Int), for key: String) { shapes[key] = shape }
+/// `/api/show` results keyed by server, model and digest. A digest's details
+/// never change (re-pulling gives a new digest), so discovery reads each model
+/// once instead of every refresh, and a slow or failed read later can't
+/// replace real capabilities with name-based guesses.
+actor OllamaDetailsCache {
+    static let shared = OllamaDetailsCache()
+    private var entries: [String: OllamaModelDetails] = [:]
+    func details(for key: String) -> OllamaModelDetails? { entries[key] }
+    func store(_ details: OllamaModelDetails, for key: String) { entries[key] = details }
 }
 
 /// A client for Ollama's native (non-OpenAI) API: model management.
@@ -249,27 +281,17 @@ public struct OllamaNativeClient: Sendable {
     }
 
     /// Reads a model's capabilities, template and shape (`POST /api/show`).
-    ///
-    /// When the model's shape is withheld from the normal response, asks once
-    /// more with `verbose` (several MB: it includes the tokenizer) and caches
-    /// that per model digest, so discovery refreshes stay cheap.
-    public func show(_ model: String, digest: String? = nil, timeout: TimeInterval = 10) async throws -> OllamaModelDetails {
-        var details = OllamaModelDetails.parse(try await showJSON(model, verbose: false, timeout: timeout))
-        guard details.shapeWithheld else { return details }
-        let key = "\(baseURL.absoluteString)|\(model)|\(digest ?? "")"
-        if let cached = await OllamaShapeCache.shared.shape(for: key) {
-            details.kvBytesPerToken = cached.perToken
-            details.fixedKVBytes = cached.fixed
-        } else {
-            let verbose = OllamaModelDetails.parse(try await showJSON(model, verbose: true, timeout: timeout))
-            if let kv = verbose.kvBytesPerToken {
-                details.kvBytesPerToken = kv
-                details.fixedKVBytes = verbose.fixedKVBytes
-                if digest != nil { await OllamaShapeCache.shared.store((kv, verbose.fixedKVBytes), for: key) }
-            }
-        }
-        details.shapeWithheld = false
-        return details
+    /// When Ollama withholds the per-layer shape, `shapeWithheld` is set and
+    /// `kvBytesPerToken` is nil; `shape(_:)` fetches it.
+    public func show(_ model: String, timeout: TimeInterval = 10) async throws -> OllamaModelDetails {
+        OllamaModelDetails.parse(try await showJSON(model, verbose: false, timeout: timeout))
+    }
+
+    /// The KV shape from verbose `/api/show` (several MB: it includes the
+    /// tokenizer), for models whose normal response withholds it.
+    func shape(_ model: String, timeout: TimeInterval) async throws -> (perToken: Int, fixed: Int)? {
+        let verbose = OllamaModelDetails.parse(try await showJSON(model, verbose: true, timeout: timeout))
+        return verbose.kvBytesPerToken.map { ($0, verbose.fixedKVBytes) }
     }
 
     private func showJSON(_ model: String, verbose: Bool, timeout: TimeInterval) async throws -> JSONValue {
@@ -278,13 +300,31 @@ public struct OllamaNativeClient: Sendable {
         return try await ProviderSupport.fetchJSON(http, HTTPRequest.json(try ProviderSupport.url(baseURL, "api/show"), body: .object(body), timeout: timeout))
     }
 
-    /// `/api/show` for every model, concurrently. Models whose details can't
-    /// be read within `timeout` are left out (callers fall back to name-based guesses).
-    public func details(for models: [OllamaModel], timeout: TimeInterval) async -> [String: OllamaModelDetails] {
-        await withTaskGroup(of: (String, OllamaModelDetails?).self) { group in
+    /// Details for every model, concurrently. Each digest is read once and
+    /// cached; `timeout` bounds the normal `/api/show`, `shapeTimeout` the
+    /// verbose shape fetch, which can fail without losing the capabilities.
+    /// Models with no details at all are left out (callers fall back to what
+    /// `/api/tags` reports, then to the name).
+    public func details(for models: [OllamaModel], timeout: TimeInterval, shapeTimeout: TimeInterval = 15) async -> [String: OllamaModelDetails] {
+        let base = baseURL.absoluteString
+        return await withTaskGroup(of: (String, OllamaModelDetails?).self) { group in
             for model in models {
                 group.addTask {
-                    (model.name, await LocalModelDiscovery.withTimeout(timeout) { try await self.show(model.name, digest: model.digest, timeout: timeout) })
+                    let key = "\(base)|\(model.name)|\(model.digest ?? "")"
+                    var details = await OllamaDetailsCache.shared.details(for: key)
+                    if details == nil {
+                        details = await LocalModelDiscovery.withTimeout(timeout) { try await self.show(model.name, timeout: timeout) }
+                    }
+                    guard var found = details else { return (model.name, nil) }
+                    if found.shapeWithheld,
+                       let shape = await LocalModelDiscovery.withTimeout(shapeTimeout, { try await self.shape(model.name, timeout: shapeTimeout) }) ?? nil {
+                        found.kvBytesPerToken = shape.perToken
+                        found.fixedKVBytes = shape.fixed
+                        found.shapeWithheld = false
+                    }
+                    // Cache once complete; a still-withheld shape is retried next time.
+                    if model.digest != nil { await OllamaDetailsCache.shared.store(found, for: key) }
+                    return (model.name, found)
                 }
             }
             var out: [String: OllamaModelDetails] = [:]
@@ -332,7 +372,9 @@ public struct OllamaNativeClient: Sendable {
                 quantization: details?["quantization_level"]?.stringValue,
                 family: details?["family"]?.stringValue,
                 families: details?["families"]?.arrayValue?.compactMap(\.stringValue) ?? [],
-                digest: entry["digest"]?.stringValue
+                digest: entry["digest"]?.stringValue,
+                capabilities: entry["capabilities"]?.arrayValue?.compactMap(\.stringValue) ?? [],
+                contextLength: details?["context_length"]?.intValue
             )
         }
     }
@@ -384,13 +426,19 @@ public struct OllamaProvider: LLMProvider {
     static func modelInfo(_ model: OllamaModel, details: OllamaModelDetails? = nil, providerID: ProviderID,
                           physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> ModelInfo {
         var capabilities: ProviderCapabilities = [.streaming]
-        if let reported = details?.capabilities, !reported.isEmpty {
+        let reported = details.flatMap { $0.capabilities.isEmpty ? nil : $0.capabilities } ?? (model.capabilities.isEmpty ? nil : model.capabilities)
+        if let reported, !reported.contains("completion"), reported.contains("embedding") {
+            // Embedding-only (bge-m3, all-minilm…): can't chat, never a chat default.
+            capabilities = [.embeddings]
+        } else if let reported {
             if reported.contains("tools") {
                 capabilities.insert(.tools)
                 if details?.forcesToolCalls == true { capabilities.insert(.eagerToolCalls) }
             }
             if reported.contains("vision") { capabilities.insert(.vision) }
             if reported.contains("thinking") { capabilities.insert(.reasoning) }
+        } else if OllamaProvider.looksLikeEmbeddingModel(model) {
+            capabilities = [.embeddings]
         } else {
             capabilities.insert(.tools)
             let lowerName = model.name.lowercased()
@@ -411,6 +459,13 @@ public struct OllamaProvider: LLMProvider {
                          contextWindow: context, capabilities: capabilities, isLocal: true, memoryBytes: memory)
     }
 
+    /// Name and family guesses for servers too old to report capabilities.
+    static func looksLikeEmbeddingModel(_ model: OllamaModel) -> Bool {
+        let name = model.name.lowercased()
+        let families = Set(([model.family].compactMap { $0 } + model.families).map { $0.lowercased() })
+        return ["embed", "minilm", "bge-", "bge:", "e5-"].contains(where: name.contains) || !families.isDisjoint(with: ["bert", "nomic-bert"])
+    }
+
     /// Context sizes Cove picks between (`num_ctx`). Larger windows cost
     /// memory up front, so this stops at 32K.
     static let contextSteps = [4_096, 8_192, 16_384, 32_768]
@@ -420,7 +475,7 @@ public struct OllamaProvider: LLMProvider {
     /// use), never more than the model was trained for. Sent with every
     /// request and used as the context budget, so the two always agree.
     static func contextLength(for model: OllamaModel, details: OllamaModelDetails?, physicalMemory: UInt64) -> Int {
-        let trained = details?.contextLength ?? KnownModels.contextWindow(for: model.name) ?? KnownModels.defaultLocalContextWindow
+        let trained = details?.contextLength ?? model.contextLength ?? KnownModels.contextWindow(for: model.name) ?? KnownModels.defaultLocalContextWindow
         guard let kvBytes = details?.kvBytesPerToken, kvBytes > 0 else {
             return min(trained, KnownModels.defaultLocalContextWindow)
         }
@@ -485,7 +540,9 @@ enum OllamaChat {
                     entry["tool_calls"] = .array(calls.map { call in
                         let arguments = (try? JSONValue.parse(call.arguments.isEmpty ? "{}" : call.arguments))
                             .flatMap { $0.objectValue != nil ? $0 : nil } ?? .object([:])
-                        return ["function": ["name": .string(call.name), "arguments": arguments]]
+                        var entry: [String: JSONValue] = ["function": ["name": .string(call.name), "arguments": arguments]]
+                        if !call.id.isEmpty { entry["id"] = .string(call.id) }
+                        return .object(entry)
                     })
                 }
                 out.append(.object(entry))
@@ -493,7 +550,9 @@ enum OllamaChat {
                 for result in message.toolResults {
                     var text = result.text
                     if result.isError && !text.hasPrefix("Error") { text = "Error: " + text }
-                    out.append(["role": "tool", "tool_name": .string(result.name), "content": .string(text)])
+                    var entry: [String: JSONValue] = ["role": "tool", "tool_name": .string(result.name), "content": .string(text)]
+                    if !result.callID.isEmpty { entry["tool_call_id"] = .string(result.callID) }
+                    out.append(.object(entry))
                 }
                 let remaining = message.content.filter {
                     if case .toolResult = $0 { return false }

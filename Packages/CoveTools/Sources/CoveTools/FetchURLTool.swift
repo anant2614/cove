@@ -101,20 +101,38 @@ public struct FetchURLTool: Tool {
         return url
     }
 
-    /// Result pages of the big search engines (e.g. google.com/search?q=…).
+    /// Result pages of the big search engines (e.g. google.com/search?q=…),
+    /// matched by their exact endpoints so other pages on the same domains
+    /// (Search Central docs, support links, RSS feeds) stay fetchable.
     static func isSearchResultsPage(_ url: URL) -> Bool {
-        guard let host = url.host?.lowercased() else { return false }
-        let labels = host.split(separator: ".")
-        let path = url.path.lowercased()
-        let hasQuery = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
-            .contains { ["q", "p", "query", "text", "wd"].contains($0.name) } ?? false
-        if labels.contains("google") || labels.contains("bing") || labels.contains("yandex") {
-            return path.hasPrefix("/search") || hasQuery
+        guard var host = url.host?.lowercased() else { return false }
+        if host.hasPrefix("www.") { host.removeFirst(4) }
+        let labels = host.split(separator: ".").map(String.init)
+        var path = url.path.lowercased()
+        if path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func has(_ name: String) -> Bool { items.contains { $0.name == name && !($0.value ?? "").isEmpty } }
+        if path.contains("/rss") || items.contains(where: { $0.name == "format" && $0.value == "rss" }) { return false }
+        switch labels.first {
+        case "google":  // google.com, google.co.in, …
+            return ["/search", "/webhp", "/"].contains(path) && has("q")
+        case "scholar", "news", "images":
+            return labels.count > 1 && labels[1] == "google" && ["/search", "/scholar", "/"].contains(path) && has("q")
+        case "bing", "cn" where labels.dropFirst().first == "bing":
+            return ["/search", "/images/search", "/news/search"].contains(path) && has("q")
+        case "yandex":
+            return path == "/search" && has("text")
+        case "duckduckgo", "html", "lite":
+            return host.hasSuffix("duckduckgo.com") && ["/", "/html", "/lite"].contains(path) && has("q")
+        case "search":
+            if host == "search.yahoo.com" { return path == "/search" && has("p") }
+            if host == "search.brave.com" { return path == "/search" && has("q") }
+            return false
+        case "baidu":
+            return path == "/s" && has("wd")
+        default:
+            return false
         }
-        if host.hasSuffix("duckduckgo.com") || host.hasSuffix("search.yahoo.com") || host.hasSuffix("baidu.com") {
-            return hasQuery
-        }
-        return false
     }
 
     enum Kind { case html, text, unsupported }

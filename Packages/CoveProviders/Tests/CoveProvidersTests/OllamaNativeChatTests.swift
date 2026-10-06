@@ -113,6 +113,8 @@ final class OllamaNativeChatTests: XCTestCase {
         let mapped = OllamaChat.mapMessages(messages)
         XCTAssertEqual(mapped.count, 4)
         XCTAssertEqual(mapped[1]["tool_calls"]?[0]?["function"]?["arguments"]?["url"], "https://a.b", "arguments are an object, not a string")
+        XCTAssertEqual(mapped[1]["tool_calls"]?[0]?["id"], "c1")
+        XCTAssertEqual(mapped[2]["tool_call_id"], "c1", "results stay paired with their calls")
         XCTAssertEqual(mapped[2]["role"], "tool")
         XCTAssertEqual(mapped[2]["tool_name"], "fetch_url")
         XCTAssertEqual(mapped[2]["content"], "Error: blocked")
@@ -166,17 +168,63 @@ final class OllamaNativeChatTests: XCTestCase {
         XCTAssertNil(unknownSize.memoryBytes)
     }
 
-    func testShowFetchesVerboseShapeOnceAndCachesIt() async throws {
+    func testDetailsAreReadOncePerDigestAndShapeFailureKeepsCapabilities() async throws {
         let http = ShowRoutingHTTPClient(normal: try Fixtures.data("ollama/show_qwen3.5.json"),
                                          verbose: try Fixtures.data("ollama/show_qwen3.5_verbose.json"))
-        let client = OllamaNativeClient(baseURL: URL(string: "http://cache-test:11434")!, http: http)
-        let first = try await client.show("qwen3.5:9b", digest: "abc")
+        let client = OllamaNativeClient(baseURL: URL(string: "http://\(UUID().uuidString.lowercased()):11434")!, http: http)
+        let model = OllamaModel(name: "qwen3.5:9b", size: 6_594_462_816, digest: "abc")
+        let first = try XCTUnwrap(await client.details(for: [model], timeout: 2)[model.name])
         XCTAssertEqual(first.kvBytesPerToken, 8 * 4 * 512 * 2)
-        XCTAssertFalse(first.capabilities.isEmpty, "capabilities and template still come from the normal response")
-        XCTAssertEqual(http.verboseCount, 1)
-        let second = try await client.show("qwen3.5:9b", digest: "abc")
-        XCTAssertEqual(second.kvBytesPerToken, first.kvBytesPerToken)
-        XCTAssertEqual(http.verboseCount, 1, "the multi-MB verbose response is fetched once per digest")
+        XCTAssertTrue(first.capabilities.contains("thinking"))
+        let second = try XCTUnwrap(await client.details(for: [model], timeout: 2)[model.name])
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(http.counts.normal, 1, "a known digest is not read again")
+        XCTAssertEqual(http.counts.verbose, 1, "the multi-MB verbose response is fetched once")
+
+        // The verbose shape fails: capabilities and template survive, the shape is retried later.
+        let failing = ShowRoutingHTTPClient(normal: try Fixtures.data("ollama/show_qwen3.5.json"), verbose: nil)
+        let other = OllamaNativeClient(baseURL: URL(string: "http://\(UUID().uuidString.lowercased()):11434")!, http: failing)
+        let partial = try XCTUnwrap(await other.details(for: [model], timeout: 2)[model.name])
+        XCTAssertTrue(partial.capabilities.contains("thinking"))
+        XCTAssertNil(partial.kvBytesPerToken)
+        _ = await other.details(for: [model], timeout: 2)
+        XCTAssertEqual(failing.counts.verbose, 2, "a still-withheld shape is retried")
+        XCTAssertEqual(failing.counts.normal, 1)
+    }
+
+    func testTagsCapabilitiesAreUsedWhenShowIsUnavailable() throws {
+        let tags = try JSONValue.parse(#"{"models":[{"name":"qwen3.5:9b","size":6594462816,"digest":"d","capabilities":["completion","vision","tools","thinking"],"details":{"family":"qwen35","context_length":262144}},{"name":"bge-m3:latest","size":1157672605,"capabilities":["embedding"],"details":{"family":"bert"}}]}"#)
+        let models = OllamaNativeClient.parseTags(tags)
+        XCTAssertEqual(models[0].capabilities, ["completion", "vision", "tools", "thinking"])
+        XCTAssertEqual(models[0].contextLength, 262_144)
+        let qwen = OllamaProvider.modelInfo(models[0], details: nil, providerID: .ollama)
+        XCTAssertTrue(qwen.capabilities.isSuperset(of: [.tools, .vision, .reasoning]))
+        XCTAssertEqual(qwen.contextWindow, KnownModels.defaultLocalContextWindow, "no shape known: conservative context")
+        let bge = OllamaProvider.modelInfo(models[1], details: nil, providerID: .ollama)
+        XCTAssertEqual(bge.capabilities, [.embeddings], "embedding-only models can't chat")
+        // No capabilities reported at all (old server): name and family guesses.
+        let old = OllamaProvider.modelInfo(OllamaModel(name: "all-minilm:latest", size: 45_000_000, family: "bert"), providerID: .ollama)
+        XCTAssertEqual(old.capabilities, [.embeddings])
+    }
+
+    func testSlidingWindowPatternFallbacks() throws {
+        func details(_ info: String) throws -> OllamaModelDetails {
+            OllamaModelDetails.parse(try JSONValue.parse(#"{"capabilities":["completion"],"model_info":{"# + info + "}}"))
+        }
+        // Gemma 3 GGUFs have a window but no pattern key: one global layer in six.
+        let gemma3 = try details(#""general.architecture":"gemma3","gemma3.block_count":48,"gemma3.attention.head_count":16,"gemma3.attention.head_count_kv":8,"gemma3.attention.key_length":256,"gemma3.attention.value_length":256,"gemma3.attention.sliding_window":1024,"gemma3.context_length":131072"#)
+        XCTAssertEqual(gemma3.kvBytesPerToken, 8 * 8 * 512 * 2)
+        XCTAssertEqual(gemma3.fixedKVBytes, 40 * 8 * 512 * 2 * 1_024)
+        // An integer pattern period.
+        let period = try details(#""general.architecture":"x","x.block_count":4,"x.attention.head_count_kv":2,"x.attention.key_length":64,"x.attention.sliding_window":128,"x.attention.sliding_window_pattern":2"#)
+        XCTAssertEqual(period.kvBytesPerToken, 2 * 2 * 128 * 2)
+        // Hybrid model with one KV head count plus a full-attention interval.
+        let hybrid = try details(#""general.architecture":"qwen3next","qwen3next.block_count":48,"qwen3next.attention.head_count_kv":2,"qwen3next.attention.key_length":256,"qwen3next.full_attention_interval":4"#)
+        XCTAssertEqual(hybrid.kvBytesPerToken, 12 * 2 * 512 * 2)
+        // An array that doesn't cover every layer is treated as withheld, not as zero.
+        let short = try details(#""general.architecture":"x","x.block_count":4,"x.attention.head_count_kv":[],"x.attention.key_length":64"#)
+        XCTAssertTrue(short.shapeWithheld)
+        XCTAssertNil(short.kvBytesPerToken)
     }
 
     func testThinkFlagFollowsReasoningEffort() {
@@ -192,30 +240,37 @@ final class OllamaNativeChatTests: XCTestCase {
         let http = ReplayHTTPClient()
         try http.respond(to: "/api/tags", fixture: "ollama/tags.json")
         try http.respond(to: "/api/show", fixture: "ollama/show_llama3.2.json")
-        let models = try await OllamaProvider(http: http).listModels()
+        // Its own host: details are cached per server, model and digest.
+        let models = try await OllamaProvider(baseURL: URL(string: "http://\(UUID().uuidString.lowercased()):11434")!, http: http).listModels()
         XCTAssertEqual(models.map(\.id), ["llama3.2:3b", "llava:7b"])
         XCTAssertTrue(models.allSatisfy { $0.capabilities.contains(.eagerToolCalls) })
         XCTAssertEqual(http.requests.filter { $0.url.path == "/api/show" }.count, 2)
     }
 }
 
-/// Serves `/api/show`, answering verbose requests separately and counting them.
+/// Serves `/api/show`, answering verbose requests separately (or failing them
+/// when `verbose` is nil) and counting both kinds.
 final class ShowRoutingHTTPClient: HTTPClient, @unchecked Sendable {
     private let normal: Data
-    private let verbose: Data
+    private let verbose: Data?
     private let lock = NSLock()
+    private var normalRequests = 0
     private var verboseRequests = 0
-    var verboseCount: Int { lock.withLock { verboseRequests } }
+    var counts: (normal: Int, verbose: Int) { lock.withLock { (normalRequests, verboseRequests) } }
 
-    init(normal: Data, verbose: Data) {
+    init(normal: Data, verbose: Data?) {
         self.normal = normal
         self.verbose = verbose
     }
 
     func data(for request: HTTPRequest) async throws -> (Data, HTTPResponseHead) {
         let isVerbose = (try? JSONValue.parse(request.body ?? Data()))?["verbose"] == true
-        if isVerbose { lock.withLock { verboseRequests += 1 } }
-        return (isVerbose ? verbose : normal, HTTPResponseHead(statusCode: 200))
+        lock.withLock { if isVerbose { verboseRequests += 1 } else { normalRequests += 1 } }
+        if isVerbose {
+            guard let verbose else { throw ProviderError.http(status: 500, message: "verbose failed") }
+            return (verbose, HTTPResponseHead(statusCode: 200))
+        }
+        return (normal, HTTPResponseHead(statusCode: 200))
     }
 
     func lines(for request: HTTPRequest) async throws -> (HTTPResponseHead, AsyncThrowingStream<String, Error>) {

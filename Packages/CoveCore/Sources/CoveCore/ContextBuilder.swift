@@ -23,9 +23,15 @@ public struct ContextBuilder: Sendable {
         public var tools: [ToolSpec]
         public var parameters: GenerationParameters
         public var contextWindow: Int
+        /// Text appended to each user-typed message, from when it was sent
+        /// (e.g. "(sent Sun 4 Oct, 21:15)"). Derived from the message itself,
+        /// so a message reads the same in every later request and servers can
+        /// keep reusing their cached prompt prefix.
+        public var userMessageNote: (@Sendable (Date) -> String)?
 
         public init(model: String, systemPrompt: String? = nil, extraSystemBlocks: [String] = [], history: [Message],
-                    tools: [ToolSpec] = [], parameters: GenerationParameters = .init(), contextWindow: Int) {
+                    tools: [ToolSpec] = [], parameters: GenerationParameters = .init(), contextWindow: Int,
+                    userMessageNote: (@Sendable (Date) -> String)? = nil) {
             self.model = model
             self.systemPrompt = systemPrompt
             self.extraSystemBlocks = extraSystemBlocks
@@ -33,6 +39,7 @@ public struct ContextBuilder: Sendable {
             self.tools = tools
             self.parameters = parameters
             self.contextWindow = contextWindow
+            self.userMessageNote = userMessageNote
         }
     }
 
@@ -58,15 +65,24 @@ public struct ContextBuilder: Sendable {
         let fixed = (systemMessage.map(TokenEstimator.estimate) ?? 0) + TokenEstimator.estimate(input.tools)
         let budget = max(0, input.contextWindow - reserved - fixed)
 
-        let usable = input.history.filter(Self.isSendable)
+        // Cost and fit exactly what is sent: no reasoning, no tool-result images,
+        // user messages with their time note.
+        let usable = input.history.filter(Self.isSendable).map { Self.outgoing($0, note: input.userMessageNote) }
         var turns = Self.turns(of: usable)
         if let newest = turns.last { turns[turns.count - 1] = Self.fitting(newest, budget: budget) }
         var included: [[Message]] = []
         var used = 0
         for turn in turns.reversed() {
-            let cost = turn.reduce(0) { $0 + TokenEstimator.estimate($1.content) }
-            if !included.isEmpty && used + cost > budget { break }
-            included.insert(turn, at: 0)
+            var candidate = turn
+            var cost = Self.cost(of: candidate)
+            if !included.isEmpty && used + cost > budget {
+                // Keep the earlier exchange (question, calls, answers) and drop
+                // only its bulky tool output; the follow-up usually refers to it.
+                candidate = Self.withToolOutputOmitted(turn)
+                cost = Self.cost(of: candidate)
+                if used + cost > budget { break }
+            }
+            included.insert(candidate, at: 0)
             used += cost
         }
         let messages = included.flatMap { $0 }
@@ -74,16 +90,7 @@ public struct ContextBuilder: Sendable {
         var chatMessages: [ChatMessage] = []
         if let systemMessage { chatMessages.append(systemMessage) }
         for (index, message) in messages.enumerated() {
-            var content = try await hydrate(message.content, loadAttachment: loadAttachment)
-            if message.role == .tool {
-                // Tool-result images (e.g. generated images) are shown to the
-                // user, not re-sent to the model.
-                content = content.map { part in
-                    guard case .toolResult(var result) = part else { return part }
-                    result.images = []
-                    return .toolResult(result)
-                }
-            }
+            let content = try await hydrate(message.content, loadAttachment: loadAttachment)
             chatMessages.append(ChatMessage(role: message.role, content: content))
             // Every tool call must be answered, or providers reject the request
             // (happens when a run was cancelled between the call and its result).
@@ -127,41 +134,97 @@ public struct ContextBuilder: Sendable {
         }
     }
 
-    /// Fewest tokens a shortened tool result keeps.
-    static let minimumToolResultTokens = 200
-    static let toolResultTrimNote = "\n\n[shortened to fit the model's context window]"
-
-    /// Shortens the tool results in `turn` (largest first, in proportion to
-    /// their size) until the turn fits `budget`. Fetched pages are the usual
-    /// cause of a single turn outgrowing a small local context; without this
-    /// the server would silently cut the start of the prompt instead —
-    /// including the system prompt and the user's question.
-    static func fitting(_ turn: [Message], budget: Int) -> [Message] {
-        let cost = turn.reduce(0) { $0 + TokenEstimator.estimate($1.content) }
-        guard cost > budget else { return turn }
-        var sizes: [Int] = []
-        for message in turn {
-            for part in message.content {
-                if case .toolResult(let result) = part { sizes.append(TokenEstimator.estimate(result.text)) }
+    /// A message as it will be sent: reasoning is never re-sent, tool-result
+    /// images (e.g. generated images) are shown to the user but not re-sent,
+    /// and user-typed messages carry their time note.
+    static func outgoing(_ message: Message, note: (@Sendable (Date) -> String)?) -> Message {
+        var message = message
+        message.content = message.content.compactMap { part in
+            switch part {
+            case .reasoning: return nil
+            case .toolResult(var result) where message.role == .tool:
+                result.images = []
+                return .toolResult(result)
+            default: return part
             }
         }
-        let total = sizes.reduce(0, +)
-        guard total > 0 else { return turn }
-        let overflow = cost - budget
-        var index = 0
-        return turn.map { message in
+        if message.role == .user, let note, !message.content.contains(where: { if case .toolResult = $0 { true } else { false } }) {
+            message.content.append(.text(note(message.createdAt)))
+        }
+        return message
+    }
+
+    static func cost(of turn: [Message]) -> Int {
+        turn.reduce(0) { $0 + TokenEstimator.estimate($1.content) }
+    }
+
+    /// Fewest tokens a shortened tool result keeps (unless even that can't fit).
+    static let minimumToolResultTokens = 200
+    static let toolResultTrimNote = "\n\n[shortened to fit the model's context window]"
+    static let omittedToolOutput = "[earlier tool output omitted to fit the context window]"
+
+    /// The turn with every tool result replaced by a short stub. Calls and
+    /// results stay paired, so providers still accept the history.
+    static func withToolOutputOmitted(_ turn: [Message]) -> [Message] {
+        turn.map { message in
             var message = message
             message.content = message.content.map { part in
                 guard case .toolResult(var result) = part else { return part }
-                let size = sizes[index]
-                index += 1
-                let keep = max(minimumToolResultTokens, size - Int((Double(overflow) * Double(size) / Double(total)).rounded(.up)))
-                guard keep < size else { return part }
-                let characters = Int(Double(keep) * TokenEstimator.charactersPerToken / TokenEstimator.safetyMargin)
-                result.text = String(result.text.prefix(characters)) + toolResultTrimNote
+                result.text = omittedToolOutput
+                result.images = []
                 return .toolResult(result)
             }
             return message
+        }
+    }
+
+    /// Shortens the tool results in `turn` until it fits `budget`: the largest
+    /// results are cut first, down to a common cap. If even
+    /// `minimumToolResultTokens` per result doesn't fit, the oldest results are
+    /// replaced by a stub, newest last. Fetched pages are the usual cause of a
+    /// single turn outgrowing a small local context; without this the server
+    /// would cut the start of the prompt instead, or reject the request.
+    static func fitting(_ turn: [Message], budget: Int) -> [Message] {
+        var turn = turn
+        guard cost(of: turn) > budget else { return turn }
+        // (message, part) positions of tool results, oldest first.
+        var slots: [(Int, Int)] = []
+        for (m, message) in turn.enumerated() {
+            for (p, part) in message.content.enumerated() { if case .toolResult = part { slots.append((m, p)) } }
+        }
+        guard !slots.isEmpty else { return turn }
+        let noteCost = TokenEstimator.estimate(toolResultTrimNote)
+        func text(_ slot: (Int, Int)) -> String {
+            if case .toolResult(let result) = turn[slot.0].content[slot.1] { return result.text }
+            return ""
+        }
+        func setText(_ slot: (Int, Int), _ value: String) {
+            guard case .toolResult(var result) = turn[slot.0].content[slot.1] else { return }
+            result.text = value
+            turn[slot.0].content[slot.1] = .toolResult(result)
+        }
+        var stubbed = 0
+        while true {
+            let open = Array(slots[stubbed...])
+            let sizes = open.map { TokenEstimator.estimate(text($0)) }
+            let room = budget - (cost(of: turn) - sizes.reduce(0, +))
+            // Largest cap c with Σ min(size, c) (+ note when cut) ≤ room.
+            func needed(_ c: Int) -> Int { sizes.reduce(0) { $0 + ($1 > c ? c + noteCost : $1) } }
+            var low = 0, high = sizes.max() ?? 0
+            while low < high {
+                let mid = (low + high + 1) / 2
+                if needed(mid) <= room { low = mid } else { high = mid - 1 }
+            }
+            let cap = needed(low) <= room ? low : 0
+            if cap >= minimumToolResultTokens || open.count == 1 {
+                for (slot, size) in zip(open, sizes) where size > cap {
+                    let characters = Int(Double(cap) * TokenEstimator.charactersPerToken / TokenEstimator.safetyMargin)
+                    setText(slot, String(text(slot).prefix(characters)) + toolResultTrimNote)
+                }
+                return turn
+            }
+            setText(slots[stubbed], omittedToolOutput)
+            stubbed += 1
         }
     }
 

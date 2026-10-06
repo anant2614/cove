@@ -5,6 +5,12 @@ import CoveUI
 import Foundation
 import Observation
 
+/// Composer toggles the user set for one chat.
+struct ChatChoices: Hashable {
+    var tools: Bool?
+    var thinking: Bool?
+}
+
 /// The app's composition root and shared, observable state.
 @MainActor
 @Observable
@@ -23,6 +29,10 @@ final class AppState {
     var chats: [Chat] = []
     var prompts: [Prompt] = []
     var selectedChatID: String?
+    /// Per-chat tools/thinking choices made in the composer (nil = the model's
+    /// default). Kept here, not on the view model, so they survive switching
+    /// chats and the quick panel's "Open in main window".
+    var chatChoices: [String: ChatChoices] = [:]
     var isOnline = true
     var settings = AppSettings()
     /// A fatal-ish problem at launch (e.g. the database couldn't open).
@@ -33,6 +43,7 @@ final class AppState {
     @ObservationIgnored private let settingsBox: Locked<AppSettings>
     @ObservationIgnored private var chatObservation: Task<Void, Never>?
     @ObservationIgnored private var localRefresh: Task<Void, Never>?
+    @ObservationIgnored private var localRefreshDeadline: Date?
 
     init() {
         let http = URLSessionHTTPClient()
@@ -127,18 +138,19 @@ final class AppState {
         }
     }
 
-    /// Re-probes local servers every 30 s while the model picker is open (§15).
+    /// Re-probes local servers every 30 s for 2 minutes after the model
+    /// picker opens (§15). Opening it again extends the window instead of
+    /// restarting the loop, so a probe in flight is never cancelled half-way
+    /// (a cancelled probe used to report models without their details).
     func modelPickerOpened() {
-        localRefresh?.cancel()
-        localRefresh = Task { [registry] in
-            while !Task.isCancelled {
+        localRefreshDeadline = Date().addingTimeInterval(120)
+        guard localRefresh == nil else { return }
+        localRefresh = Task { [weak self, registry] in
+            while let deadline = self?.localRefreshDeadline, Date() < deadline {
                 await registry.refreshLocal()
                 try? await Task.sleep(nanoseconds: 30_000_000_000)
             }
-        }
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 120_000_000_000)
-            self?.localRefresh?.cancel()
+            self?.localRefresh = nil
         }
     }
 
@@ -175,7 +187,12 @@ final class AppState {
     var allModels: [ModelInfo] { providers.flatMap(\.models) }
 
     func modelGroups() -> [ModelGroup] {
-        providers.map { ModelGroup(id: $0.config.id, name: $0.config.name, isLocal: $0.config.isLocal, models: $0.models) }
+        providers.map { ModelGroup(id: $0.config.id, name: $0.config.name, isLocal: $0.config.isLocal, models: $0.models.filter(Self.canChat)) }
+    }
+
+    /// Embedding-only models (bge-m3, nomic-embed-text…) can't hold a chat.
+    static func canChat(_ model: ModelInfo) -> Bool {
+        !(model.capabilities.contains(.embeddings) && !model.capabilities.contains(.streaming))
     }
 
     func resolvedDefaultModel() async -> ModelRef? {
