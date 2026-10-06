@@ -160,7 +160,7 @@ final class ProviderRegistryTests: XCTestCase {
         await registry.load()
         let ref = ModelRef(providerID: .ollama, modelID: "qwen3.5:9b")
         let before = await registry.modelInfo(for: ref)
-        XCTAssertTrue(before?.capabilities.contains(.reasoning) ?? false)
+        XCTAssertTrue(before?.capabilities.contains(.reasoning) ?? false, "first read: \(String(describing: before))")
 
         http.set(showWorks: false)  // /api/show fails this time
         await registry.refreshLocal()

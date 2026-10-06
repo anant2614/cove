@@ -25,9 +25,6 @@ public protocol ProviderResolving: Sendable {
     func modelInfo(for model: ModelRef) async -> ModelInfo?
 }
 
-extension ProviderResolving {
-    public func modelInfo(for model: ModelRef) async -> ModelInfo? { nil }
-}
 
 /// Network reachability (NWPathMonitor on Apple platforms).
 public protocol ConnectivityMonitoring: Sendable {

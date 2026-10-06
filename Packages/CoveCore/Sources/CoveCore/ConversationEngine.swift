@@ -215,7 +215,7 @@ public final class ConversationEngine: Sendable {
     /// token chat took 14 s on a 3B model and 69 s on a 14B one).
     static func currentDateBlock(now: Date, timeZone: TimeZone) -> String {
         "Today's date is \(format(now, "EEEE, d MMMM yyyy", timeZone)). The user is in the \(timeZone.identifier) time zone. "
-            + "Each user message ends with when it was sent, like \"(sent Sun 4 Oct, 21:15)\"; that is already the "
+            + "Each user message ends with when it was sent, as \"(sent <weekday> <day> <month>, <hh:mm>)\"; that is already the "
             + "user's local time, so don't convert it, and only mention it if it's relevant."
     }
 
