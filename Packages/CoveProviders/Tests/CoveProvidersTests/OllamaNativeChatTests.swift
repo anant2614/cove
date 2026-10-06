@@ -195,8 +195,16 @@ final class OllamaNativeChatTests: XCTestCase {
         XCTAssertTrue(partial.capabilities.contains("thinking"))
         XCTAssertNil(partial.kvBytesPerToken)
         _ = await other.details(for: [model], timeout: 2)
-        XCTAssertEqual(failing.counts.verbose, 2, "a still-withheld shape is retried")
+        XCTAssertEqual(failing.counts.verbose, 1, "a withheld shape isn't re-fetched on every refresh")
         XCTAssertEqual(failing.counts.normal, 1)
+
+        // …but is asked for again once the retry interval has passed.
+        let cache = OllamaDetailsCache()
+        let start = Date()
+        let claimed = await cache.claimShapeAttempt(for: "k", now: start)
+        let tooSoon = await cache.claimShapeAttempt(for: "k", now: start.addingTimeInterval(60))
+        let later = await cache.claimShapeAttempt(for: "k", now: start.addingTimeInterval(OllamaDetailsCache.shapeRetryInterval + 1))
+        XCTAssertEqual([claimed, tooSoon, later], [true, false, true])
     }
 
     func testTagsCapabilitiesAreUsedWhenShowIsUnavailable() throws {
